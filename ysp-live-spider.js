@@ -129,10 +129,12 @@ function rsaEncryptOAEP(dataB64, publicKeyB64) {
 // ---- 简单键值持久化（设备身份、JCE guid）----
 let storePath = null;
 let storeCache = null;
+let storeWritable = true;
 
 function storeInit(customPath) {
     storePath = customPath || path.join(__dirname, "ysp-store.json");
     storeCache = null;
+    storeWritable = true;
 }
 
 function storeGet(key) {
@@ -150,9 +152,11 @@ function storeGet(key) {
 function storeSet(key, value) {
     if (storeCache === null) storeCache = {};
     storeCache[key] = value;
+    if (!storeWritable) return;
     try {
         fs.writeFileSync(storePath, JSON.stringify(storeCache));
     } catch (e) {
+        storeWritable = false;
         debugLog("store write failed: " + (e && e.message ? e.message : e));
     }
 }
@@ -2671,6 +2675,12 @@ function createSpider(site) {
             searchable: 1,
             quickSearch: 1,
             filterable: 0,
+        },
+
+        // 由 bundle 适配层在每次 play() 前调用，使 timeshift 地址用上
+        // 服务实际监听的协议与 host（默认 127.0.0.1:9988）。
+        setProxyBase(url) {
+            if (typeof url === "string" && url) options.proxyBase = url.replace(/\/+$/, "");
         },
 
         init(ext) {

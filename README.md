@@ -10,9 +10,16 @@
 
 - `ysp-live-spider.js` — spider 本体（Node.js CommonJS，导出 spider 对象 `{ meta, init, home, homeVod, category, detail, play, search, live, proxy, destroy }`）
 
+## 重建的 bundle（供 JSTV 直接使用）
+
+- `cat/index.js` — 在官方 CatVodSpider iOS bundle（CatVodSpiderios 0.1.0）基础上，把本 spider 作为内置站点 `nodejs_ysp` 编进去的重建版；原 bundle 内容未改动，仅追加 YSP spider。
+- `cat/index.js.md5` — `cat/index.js` 的 MD5 校验值。
+- JSTV 里粘贴 `.md5` 链接：https://raw.githubusercontent.com/freefly353/ysp-live-spider/main/cat/index.js.md5
+- 本地验证：重建服务在本地跑通过（/health、站点列表含 nodejs_ysp、init/home/category/detail/search/play 路由均通）；play() 的真实上游仍需在自己网络验证。
+
 ## 安装
 
-JSTV 下发的 CatVodSpider iOS 服务端 bundle 只认编译进去的内置 spider：新 spider 须随 bundle 一起重建打包，再托管新的 `index.js` + `.md5` 供 JSTV 拉取。站点配置示例：
+JSTV 下发的 CatVodSpider iOS 服务端 bundle 只认编译进去的内置 spider：新 spider 须随 bundle 一起重建打包，再托管新的 `index.js` + `.md5` 供 JSTV 拉取（见上节，本仓库已提供重建版）。站点配置示例：
 
 ```json
 { "key": "nodejs_ysp", "name": "央视频", "type": 3, "searchable": 1, "quickSearch": 1, "filterable": 0 }
