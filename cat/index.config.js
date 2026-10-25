@@ -103,7 +103,7 @@ var index_config_default = {
     cookie: ""
   },
   sites: {
-    list: []
+    list: [{key: "nodejs_ysp", name: "央视频", enable: true}]
   },
   pans: {
     list: []
