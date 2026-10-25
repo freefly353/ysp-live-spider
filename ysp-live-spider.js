@@ -24,7 +24,7 @@
  *     不填时默认写本文件同目录的 ysp-store.json，写失败则只保存在内存里。
  *
  * 频道呈现（bundle 没有 /live 路由，故不用 live() 交付频道）：
- *   - home() 给出“央视 / 卫视 / 全部”三个分类；category() 返回频道卡片；
+ *   - home() 只给一个“全部”分类（进站即直接列出全部 64 个频道）；category() 返回频道卡片；
  *     detail() 给出播放线路（自动 / Device / BK / JCE）；play() 在点播时
  *     实时解析出带签名的播放地址并返回 { parse: 0, url, header }。
  *   - live() 按 CatVod 文档实现（返回分组频道结构），但本 bundle 不暴露
@@ -2709,12 +2709,9 @@ function createSpider(site) {
         },
 
         home(filter) {
+            // 单一分类“全部”：进站即直接列出全部 64 个频道，不用再点分类。
             return {
-                class: [
-                    { type_id: "cctv", type_name: "央视" },
-                    { type_id: "ws", type_name: "卫视" },
-                    { type_id: "all", type_name: "全部" },
-                ],
+                class: [{ type_id: "all", type_name: "全部" }],
             };
         },
 

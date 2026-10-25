@@ -12,8 +12,9 @@
 
 ## 重建的 bundle（供 JSTV 直接使用）
 
-- `cat/index.js` — 在官方 CatVodSpider iOS bundle（CatVodSpiderios 0.1.0）基础上，把本 spider 作为内置站点 `nodejs_ysp` 编进去的重建版；原 bundle 内容未改动，仅追加 YSP spider。
+- `cat/index.js` — 在官方 CatVodSpider iOS bundle（CatVodSpiderios 0.1.0）基础上重建：**只保留央视频 spider（`nodejs_ysp`）**，其余 53 个内置 spider 已从启动列表移除（原 bundle 内容除此之外未改动）。站点列表里将只剩央视频。
 - `cat/index.js.md5` — `cat/index.js` 的 MD5 校验值。
+- `cat/index.config.js` + `cat/index.config.js.md5` — JSTV 添加源时会从同一目录下载的 App 配置。**这两个文件缺了会导致添加源时报下载失败 404**，2026-10-25 补上后才完整。配置以原 bundle 发行版自带的为准，只改了一处：`sites.list` 限定为仅 `nodejs_ysp`（央视频），其余网盘登录等设置项原样保留。
 - JSTV 里粘贴 `.md5` 链接：https://raw.githubusercontent.com/freefly353/ysp-live-spider/main/cat/index.js.md5
 - 本地验证：重建服务在本地跑通过（/health、站点列表含 nodejs_ysp、init/home/category/detail/search/play 路由均通）；play() 的真实上游仍需在自己网络验证。
 
