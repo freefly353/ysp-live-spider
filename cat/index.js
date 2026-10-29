@@ -3142,117 +3142,6 @@ function createSpider(site) {
         }
     }
 
-    // ---- 直播代理（方案2）----
-    // play() 返回本地代理地址而非上游直链；代理在服务端拉上游 m3u8、改写
-    // 分片/变体/key 地址、上游地址过期时自动重新签名，保证直播不断流。
-    // 注意：bundle 的 /proxy 路由会把 proxy() 的 [status, ct, body, headers]
-    // 元组 JSON 序列化（实测返回的是 JSON 数组而非真实 HTTP 响应），所以
-    // bundle 适配层必须用 Fastify reply 对象按元组发送（见打包脚本）；本文件
-    // 仍按元组返回，分片/key 的 body 为 Buffer（适配层按二进制发送）。
-    const liveProxySessions = new Map(); // sessionKey -> {headers, expiresAt, upstreamUrl}
-
-    function liveProxySource(resultSource) {
-        if (resultSource === "device") return "device";
-        if (resultSource === "JCE") return "jce";
-        return "bk"; // "BK live" 及其他都按 bk 处理
-    }
-
-    function liveProxySessionKey(channelId, source, rate) {
-        return channelId + "|" + source + "|" + (rate || "36p");
-    }
-
-    function liveProxyPlaylistUrl(channelId, source, rate) {
-        return (
-            options.proxyBase +
-            "/spider/ysp/3/proxy/live.m3u8?channel=" +
-            encodeURIComponent(channelId) +
-            "&source=" +
-            encodeURIComponent(source) +
-            "&rate=" +
-            encodeURIComponent(rate || "36p")
-        );
-    }
-
-    function liveProxySessionHeaders(sessionKey) {
-        const sess = sessionKey ? liveProxySessions.get(sessionKey) : null;
-        return (sess && sess.headers) || {};
-    }
-
-    function resolveUpstreamUrl(absoluteOrRelative, baseUrl) {
-        try {
-            return new URL(absoluteOrRelative, baseUrl).toString();
-        } catch {
-            return absoluteOrRelative;
-        }
-    }
-
-    function segmentContentType(url) {
-        const u = String(url || "").toLowerCase().split("?")[0];
-        if (u.endsWith(".m4s")) return "video/iso.segment";
-        if (u.endsWith(".ts")) return "video/MP2T";
-        if (u.endsWith(".m3u8")) return "application/vnd.apple.mpegurl";
-        return "application/octet-stream";
-    }
-
-    function rewriteLivePlaylist(text, upstreamPlaylistUrl, sessionKey) {
-        const lines = String(text || "").split(/\r?\n/);
-        const out = [];
-        const sParam = "&s=" + encodeURIComponent(sessionKey || "");
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            if (!line) { out.push(line); continue; }
-            if (line.startsWith("#EXT-X-STREAM-INF")) {
-                out.push(line);
-                if (i + 1 < lines.length && lines[i + 1] && !lines[i + 1].startsWith("#")) {
-                    const abs = resolveUpstreamUrl(lines[i + 1].trim(), upstreamPlaylistUrl);
-                    out.push(options.proxyBase + "/spider/ysp/3/proxy/pl.m3u8?u=" + encodeURIComponent(abs) + sParam);
-                    i++;
-                }
-                continue;
-            }
-            if (line.startsWith("#EXT-X-KEY") || line.startsWith("#EXT-X-MAP") || line.startsWith("#EXT-X-MEDIA")) {
-                const rewritten = line.replace(/URI="([^"]+)"/g, (m, uri) => {
-                    const abs = resolveUpstreamUrl(uri, upstreamPlaylistUrl);
-                    const action = line.startsWith("#EXT-X-MEDIA") ? "pl.m3u8" : "key";
-                    return 'URI="' + options.proxyBase + "/spider/ysp/3/proxy/" + action + "?u=" + encodeURIComponent(abs) + sParam + '"';
-                });
-                out.push(rewritten);
-                continue;
-            }
-            if (line.startsWith("#")) { out.push(line); continue; }
-            const abs = resolveUpstreamUrl(line.trim(), upstreamPlaylistUrl);
-            out.push(options.proxyBase + "/spider/ysp/3/proxy/seg?u=" + encodeURIComponent(abs) + sParam);
-        }
-        return out.join("\n");
-    }
-
-    async function fetchLivePlaylist(channel, source, rate) {
-        // 返回 {playlistText, upstreamUrl, sessionKey}；上游地址过期时自动重签。
-        const sessionKey = liveProxySessionKey(channel.id, source, rate);
-        let result;
-        try {
-            result = await resolveSource(channel, { source, rate }, false);
-        } catch (e) {
-            result = await resolveSource(channel, { source: "auto", rate }, true);
-        }
-        let res = await httpRequest({ url: result.url, headers: result.headers || {}, timeoutSeconds: 15 });
-        if (res.status !== 200 || !res.body || res.body.indexOf("#EXTM3U") < 0) {
-            // 上游地址可能刚过期：强制重新解析一次再拉
-            result = await resolveSource(channel, { source: "auto", rate }, true);
-            res = await httpRequest({ url: result.url, headers: result.headers || {}, timeoutSeconds: 15 });
-            if (res.status !== 200 || !res.body || res.body.indexOf("#EXTM3U") < 0) {
-                throw new Error("上游列表拉取失败 HTTP " + res.status);
-            }
-        }
-        liveProxySessions.set(sessionKey, {
-            headers: result.headers || {},
-            expiresAt: result.expiresAt || Date.now() / 1000 + 300,
-            upstreamUrl: result.url,
-        });
-        if (liveProxySessions.size > 128) liveProxySessions.delete(liveProxySessions.keys().next().value);
-        return { playlistText: res.body, upstreamUrl: result.url, sessionKey };
-    }
-
     async function resolveSource(channel, q, force = false) {
         const source = q.source || "auto";
         if (!["auto", "device", "bk", "jce"].includes(source)) throw fail("Unknown source");
@@ -3452,13 +3341,10 @@ function createSpider(site) {
             try {
                 const result = await resolveSource(channel, { source, rate: options.defaultRate });
                 device.mediaActivity({ kind: "activity", sessionID: "play", channelID: channel.id });
-                // 方案2：不直接给上游短有效期地址，改给本地代理地址；代理在
-                // 服务端持续续签，播放器轮询代理地址即可不断流。
-                const proxySource = liveProxySource(result.source);
                 const response = {
                     parse: 0,
-                    url: liveProxyPlaylistUrl(channel.id, proxySource, options.defaultRate),
-                    header: {},
+                    url: result.url,
+                    header: result.headers || {},
                     list: [detailVod(channel)],
                 };
                 if (result.source === "JCE" && CATCHUP_IDS.has(channel.id)) {
@@ -3509,57 +3395,7 @@ function createSpider(site) {
                 }
             }
             query = query || {};
-            // 代理路径可能带扩展名（live.m3u8 / pl.m3u8 / seg.ts），先归一化
-            let action = query.do || query.action || "";
-            action = String(action).replace(/\.(m3u8|ts|m4s)$/i, "");
-            if (action === "live") {
-                const channel = findChannel(query.channel);
-                if (!channel) {
-                    return [400, "application/json", JSON.stringify({ error: "invalid channel" }), { "Content-Type": "application/json" }];
-                }
-                const source = ["auto", "device", "bk", "jce"].includes(query.source) ? query.source : "auto";
-                const rate = query.rate || options.defaultRate;
-                try {
-                    const fetched = await fetchLivePlaylist(channel, source, rate);
-                    const rewritten = rewriteLivePlaylist(fetched.playlistText, fetched.upstreamUrl, fetched.sessionKey);
-                    return [200, "application/vnd.apple.mpegurl", rewritten, { "Content-Type": "application/vnd.apple.mpegurl" }];
-                } catch (e) {
-                    return [502, "application/json", JSON.stringify({ error: String((e && e.message) || e).slice(0, 200) }), { "Content-Type": "application/json" }];
-                }
-            }
-            if (action === "pl") {
-                const u = query.u;
-                if (!u) {
-                    return [400, "application/json", JSON.stringify({ error: "missing u" }), { "Content-Type": "application/json" }];
-                }
-                try {
-                    const res = await httpRequest({ url: u, headers: liveProxySessionHeaders(query.s), timeoutSeconds: 15 });
-                    if (res.status !== 200 || !res.body) {
-                        return [502, "text/plain", "upstream playlist error", { "Content-Type": "text/plain" }];
-                    }
-                    const rewritten = rewriteLivePlaylist(res.body, u, query.s || "");
-                    return [200, "application/vnd.apple.mpegurl", rewritten, { "Content-Type": "application/vnd.apple.mpegurl" }];
-                } catch (e) {
-                    return [502, "application/json", JSON.stringify({ error: String((e && e.message) || e).slice(0, 200) }), { "Content-Type": "application/json" }];
-                }
-            }
-            if (action === "seg" || action === "key") {
-                const u = query.u;
-                if (!u) {
-                    return [400, "application/json", JSON.stringify({ error: "missing u" }), { "Content-Type": "application/json" }];
-                }
-                try {
-                    const res = await httpBinary({ url: u, headers: liveProxySessionHeaders(query.s), timeoutSeconds: 30 });
-                    if (res.status !== 200 || !res.body) {
-                        return [502, "text/plain", "upstream segment error", { "Content-Type": "text/plain" }];
-                    }
-                    const buf = Buffer.from(res.body, "base64");
-                    const ct = action === "key" ? "application/octet-stream" : segmentContentType(u);
-                    return [200, ct, buf, { "Content-Type": ct }];
-                } catch (e) {
-                    return [502, "application/json", JSON.stringify({ error: String((e && e.message) || e).slice(0, 200) }), { "Content-Type": "application/json" }];
-                }
-            }
+            const action = query.do || query.action || "";
             if (action !== "timeshift") {
                 return [404, "text/plain", "unknown proxy action", { "Content-Type": "text/plain" }];
             }
@@ -3592,7 +3428,6 @@ function createSpider(site) {
             cache.clear();
             pending.clear();
             jceCooldown.clear();
-            liveProxySessions.clear();
         },
 
         // 仅供本地验证。
@@ -3623,12 +3458,11 @@ category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"cctv"
 detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
 search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
 play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
+proxy(req){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return core.proxy(params);},
 destroy(){return core.destroy();}
 };
 return spider;
 }
-
 function xh0(e){return[ysp0(e)]}async function ch0(e){let t=e.config,n=new _j;e.notifier=new GG(e.messageToDart),fo0(n,e);let s=new wj({registry:n,maxLinksPerProvider:t.pan.maxLinksPerProvider,showTranscode:t.pan.showTranscode,showUcUnlimited:t.pan.showUcUnlimited,providerOrder:t.pan.priority});e.panService=s;let c=new Ej(s,{notifier:e.notifier});return e.panAdapter=c,e.embyAccounts=await xm0(e),xh0({registry:n,panService:s,panAdapter:c,credentials:e.credentials,db:e.db,config:t,remoteWexConfig:e.remoteWexConfig,messageToDart:e.messageToDart,embyAccounts:e.embyAccounts})}var dh0=["\u7F8E\u5267","\u97E9\u5267","\u65E5\u5267","\u53F0\u5267","\u6E2F\u5267","\u6E2F\u53F0\u5267","\u56FD\u4EA7\u5267","\u5927\u9646\u5267","\u5185\u5730\u5267","\u6CF0\u5267","\u82F1\u5267","\u7F8E\u5267\u7248","\u82F1\u5267\u7248","\u65E5\u5267\u7248","\u97E9\u5267\u7248","\u53F0\u5267\u7248","\u6E2F\u5267\u7248","\u6CF0\u5267\u7248","\u5F71\u540E","\u5F71\u5E1D","\u56FD\u5267","\u5FAE\u77ED\u5267","\u77ED\u5267","\u7535\u5F71","\u5267\u96C6","\u7EFC\u827A","\u72AF\u7F6A","\u52A8\u6F2B","\u52A8\u753B","\u7EAA\u5F55\u7247","\u77ED\u7247","\u8FDE\u7EED\u5267","\u7CFB\u5217\u5267","\u7F51\u7EDC\u5267","\u7535\u89C6\u5267"],Str=["\u5F71\u7247","\u7247\u5B50","\u7247\u82B1","\u7247\u6BB5","\u9884\u544A","\u9884\u544A\u7247","\u82B1\u7D6E","\u5E55\u540E","\u8BBF\u8C08","\u7279\u522B\u7BC7","\u756A\u5916\u7BC7","OVA","OAD","SP","TV\u7248","\u5267\u573A\u7248","\u7535\u5F71\u7248","\u5F71\u7248","\u5267\u7248","\u56FD\u8BED\u7248","\u666E\u901A\u8BDD\u7248","\u7CA4\u8BED\u7248","\u95FD\u5357\u8BED\u7248","\u5BA2\u5BB6\u8BED\u7248","\u5434\u8BED\u7248","\u5DDD\u8BED\u7248","\u6E58\u8BED\u7248","\u8D63\u8BED\u7248","\u7CA4\u8BED\u914D\u97F3\u7248","\u56FD\u8BED\u914D\u97F3\u7248","\u666E\u901A\u8BDD\u914D\u97F3\u7248","\u65B9\u8A00\u7248","\u539F\u7248\u914D\u97F3","\u539F\u97F3\u7248","\u53F0\u8BED\u7248","\u7CA4\u8BED\u4E2D\u5B57\u7248","\u56FD\u8BED\u4E2D\u5B57\u7248","\u666E\u901A\u8BDD\u4E2D\u5B57\u7248","\u7CA4\u8BED\u539F\u58F0\u7248","\u56FD\u8BED\u539F\u58F0\u7248","\u666E\u901A\u8BDD\u539F\u58F0\u7248","\u7CA4\u8BED\u5185\u5D4C\u5B57\u5E55\u7248","\u56FD\u8BED\u5185\u5D4C\u5B57\u5E55\u7248","\u666E\u901A\u8BDD\u5185\u5D4C\u5B57\u5E55\u7248","\u52A8\u753B\u7248","\u771F\u4EBA\u7248","\u6539\u7F16\u7248","\u91CD\u5236\u7248","\u4FEE\u590D\u7248","\u52A0\u957F\u7248","\u672A\u5220\u51CF\u7248","\u5B8C\u6574\u7248","\u5BFC\u6F14\u526A\u8F91\u7248","\u7EC8\u6781\u7248","\u7279\u522B\u7248","\u9650\u5B9A\u7248","\u6536\u85CF\u7248","\u8C6A\u534E\u7248","\u5178\u85CF\u7248","\u9AD8\u6E05\u7248","\u8D85\u6E05\u7248","\u6807\u6E05\u7248","HD\u7248","UHD\u7248","4K\u7248","\u84DD\u5149\u7248","DVD\u7248","BD\u7248","WEB\u7248","TVrip","BDrip","DVDrip","HDrip","WEB-DL","HDTV","BRRip","HDRip","BluRay","TS","TC","CAM","\u62A2\u5148\u7248","\u67AA\u7248","\u5077\u62CD\u7248","\u6CC4\u9732\u7248","\u62A2\u5148\u770B","\u6B63\u7247","\u6B63\u7247\u7247\u6BB5","\u6B63\u7247\u7CBE\u534E","\u7CBE\u5F69\u7247\u6BB5","\u7CBE\u5F69\u96C6\u9526","\u7CBE\u9009\u7247\u6BB5","\u9AD8\u80FD\u7247\u6BB5","\u9AD8\u5149\u65F6\u523B","\u526A\u8F91\u7248","\u6DF7\u526A","MV","\u4E3B\u9898\u66F2","\u63D2\u66F2","\u7247\u5C3E\u66F2","\u914D\u4E50","\u539F\u58F0","OST","\u539F\u58F0\u5E26","\u97F3\u4E50\u96C6","\u97F3\u4E50\u4F1A","\u6F14\u5531\u4F1A","Live","Live\u7248","\u73B0\u573A\u7248","\u821E\u53F0\u7248","\u821E\u53F0\u5267","\u7EFC\u827A\u79C0","\u771F\u4EBA\u79C0","\u8131\u53E3\u79C0","\u8BBF\u8C08\u8282\u76EE","\u7EAA\u5F55\u7247\u7CFB\u5217","\u4E13\u9898\u7247","\u79D1\u6559\u7247","\u52A8\u753B\u7247","\u52A8\u6F2B\u7247","\u52A8\u753B\u7535\u5F71","\u52A8\u753B\u7CFB\u5217","\u52A8\u753B\u5267\u96C6","\u7535\u5F71\u5408\u96C6","\u7CFB\u5217\u5408\u96C6","\u5408\u96C6\u7248","\u5168\u96C6","\u5168\u7CFB\u5217","\u5168\u5B63","\u7B2C\u4E00\u5B63","\u7B2C\u4E8C\u5B63","\u7B2C\u4E09\u5B63","\u7B2C\u56DB\u5B63","\u7B2C\u4E94\u5B63","\u7B2C\u516D\u5B63","\u7B2C\u4E03\u5B63","\u7B2C\u516B\u5B63","\u7B2C\u4E5D\u5B63","\u7B2C\u5341\u5B63","\u66F4\u65B0\u4E2D","\u5B8C\u7ED3","\u5B8C\u7ED3\u7BC7","\u5B8C\u7ED3\u5B63","\u6700\u7EC8\u5B63","\u6700\u7EC8\u7AE0","\u7EC8\u7AE0","\u7EC8\u7BC7","\u5927\u7ED3\u5C40","\u5168\u5267\u7EC8","BD","BDRIP","WEB-DL","HDRip","DVDRip","BDRip","BRRip","Rip","IMAX","HD","HDR","UHD","4K","1080p","720p","2160p","480p","120fps","60fps","x264","x265","H264","HEVC","AAC","dts","ddp","truehd","10bit","8bit","5\\.1","7\\.1","\u56FD\u8BED","\u7CA4\u8BED","\u82F1\u8BED","\u65E5\u8BED","\u97E9\u8BED","\u6CF0\u8BED","\u6CD5\u8BED","\u5FB7\u8BED","\u4E2D\u5B57","\u7B80\u4E2D","\u7E41\u4E2D","\u7B80\u7E41\u4E2D\u5B57","\u4E2D\u82F1\u53CC\u5B57","\u5185\u5D4C","\u5185\u5C01","\u675C\u6BD4\u5168\u666F\u58F0","\u675C\u6BD4\u97F3\u6548","\u65E0\u6C34\u5370","\u89E3\u8BF4\u7248","\u62A2\u5148","\u4E24\u5B63\u5168","DV","\u538B\u5236","HQ","\u5E27","\u8C46\u74E3","\u66F4\u65B0","\u66F4\u65B0\u5230","\u63A8\u8350","\u52A8\u4F5C","\u5192\u9669","\u7231\u60C5","\u79D1\u5E7B","\u60AC\u7591","\u60CA\u609A","\u6050\u6016","\u559C\u5267","\u5267\u60C5","\u5947\u5E7B","\u6218\u4E89","\u5386\u53F2","\u4F20\u8BB0","\u97F3\u4E50","\u5BB6\u5EAD","\u513F\u7AE5","\u4F53\u80B2","\u707E\u96BE","\u9AD8\u6E05","\u8D85\u6E05","\u6807\u6E05","\u62A2\u9C9C\u770B","\u9996\u64AD","\u72EC\u64AD","\u70ED\u64AD","\u8FDE\u8F7D\u4E2D","\u6700\u65B0","\u7ECF\u5178","\u70ED\u95E8","\u83B7\u5956","\u53E3\u7891","\u597D\u8BC4","\u9AD8\u5206","\u8C46\u74E3\u9AD8\u5206","IMDb\u9AD8\u5206","\u84DD\u5149","\u4FEE\u590D","\u91CD\u5236","\u539F\u753B","\u5408\u96C6","\u5957\u88C5","\u7CFB\u5217","\u756A\u5916","\u7EED\u96C6","\u524D\u4F20","\u540E\u4F20","\u91CD\u542F","\u7FFB\u62CD"],cme=mh0(dh0),ume=mh0([...dh0,...Str]),uh0=new Map("\u96F6\u4E00\u4E8C\u4E09\u56DB\u4E94\u516D\u4E03\u516B\u4E5D".split("").map((e,t)=>[e,t])),Etr=new Map([["\u5341",10],["\u767E",100],["\u5343",1e3],["\u4E07",1e4],["\u4EBF",1e8]]);function fme(e){if(!String(e||"").trim())return"";let t=String(e).trim().replace(/丨/g,"").replace(/-/g," ").replace(cme,"").replace(/\s+/g," ").trim(),n=Ntr(t),s=/^([\u4e00-\u9fa5]+\d+)(?=：|\s|$)/u.exec(t);if(s)return s[1];let c=/^([\u4e00-\u9fa5]+[\u4e00-\u9fa50-9]+)\s*(?=\(\d{4}\))/u.exec(t);if(c)return c[1];let l=/^([\u4e00-\u9fa5]+[\u4e00-\u9fa5 ,.，。、]+)\s*(?=\(|【|\s+\d{4})/u.exec(t)?.[1]?.trim()||"",d=!1,m=/《(.+?)》/u.exec(t);if(m)t=m[1],d=!0;else{let y=/【(.+?)】/u.exec(t);cme.lastIndex=0,y&&!y[1].includes("/")&&!cme.test(y[1])&&(t=y[1],d=!0)}!d&&l&&(t=l),t=t.replace(/-.*/u,"").replace(/\b\d{4}\b/u,"").replace(/\[.*?\]/gu,(y,v)=>v===0?y:" ").replace(/\{.*?\}|（.*?）|「.*?」/gu," ").replace(/\b\d+(?:\.\d+)?[GMK]B?\b/giu,"").replace(ume,"").replace(/豆瓣\d+(?:\.\d+)?/gu,"").replace(/\b\d+(?=fps|帧)/giu,"").replace(/\b[a-zA-Z]\b/gu,"").replace(/\d+/g,(y,v,w)=>{let T=v>0?w[v-1]:"",I=w[v+y.length]||"";return!lh0(T)&&!lh0(I)?"":y}).replace(/[^\u4e00-\u9fa5a-zA-Z0-9 ]/g,"").replace(/\s+/g," ").trim(),t.includes(" ")&&(t=t.slice(0,t.indexOf(" "))),!d&&l&&(t=t.replace(/\s/g,""));let g=/([\u4e00-\u9fa5]{2,})\s*$/u.exec(String(e));if(g&&(t.length<2||/^\d+集$/u.test(t))&&(t=g[1]),!t){let y=/\[(.*?)\]/u.exec(String(e));y&&(t=y[1].replace(ume,"").replace(/\d+/gu,"").replace(/\s+/g," ").trim())}return(!/[\u4e00-\u9fa5]{2,}/u.test(t)||/^\.?[a-z]*gb$/iu.test(t))&&n&&(t=n),t}function _Y(e){if(!String(e||""))return"";let t=String(e),n=t.lastIndexOf(".");n>0&&(t=t.slice(0,n));let s=/^\s*[\[【]\s*0*(\d{1,8})\s*[\]】]/u.exec(t);if(s)return sh(s[1]);let c=Ttr(t);return c||(t=Itr(t),Rtr(t)||Ctr(t)||"")}function Ttr(e){let t=String(e).replace(/(\[|\{|（|【).*?(\]|\}|）|】)/gu," ");if(/s\d+e\d+/iu.test(t))return"";let n=/[\u4e00-\u9fa5\-_.\s]+(0*\d{1,8})(?:[\-_.\s]|$)/u.exec(t);return n&&lme(n[1])?sh(n[1]):(n=/^0*\d{1,8}$/u.exec(t.trim()),n&&lme(n[0])?sh(n[0]):"")}function Itr(e){return String(e).replace(/[（()[\]【】{}]\s*([上中下])\s*[）()[\]【】{}]/gu,"$1").replace(/(\[|\{|（|【).*?(\]|\}|）|】)/gu," ").replace(/\d+\s*(?:fps|帧|frames?|hz|赫兹)/giu," ").replace(/\b(\d+(?:p|k|i)|4k|8k|uhd|hd|fhd|qhd|2160p|1440p|1080p|720p|480p|360p)\b/giu," ").replace(/\b(19|20)\d{2}\b/gu," ").replace(/\b(?:dts|ddp|aac|ac3|eac3|truehd|atmos)\d+(?:\.\d+)?\b/giu," ").replace(/\b\d+\.\d+\b/gu," ").replace(/\b(8bit|10bit|12bit)\b/giu," ").replace(/\b(hdr|hdr10|hdr10\+|dolby vision|dv|hlg)\b/giu," ").replace(/\b(x264|x265|h\.264|h\.265|h264|h265|hevc|mpeg4|av1|vp9)\b/giu," ").replace(/\b(web-dl|bluray|bdrip|hdrip|dvdrip|brrip|hdtv|dvdr|cam|ts|tc|r5|scr)\b/giu," ").replace(/\b(hq|sd|hd|fhd|uhd|imax|superbit|remux|extended|uncut|directors cut|dc|special edition|se)\b/giu," ").replace(/\b(高码|高码率|高码版|超清|高清|标清|无水印|完整版|未删减|加长版|导演剪辑版|特效字幕|内嵌字幕|双语字幕|中文字幕|英文字幕|繁体字幕|简体字幕|多音轨|杜比音效|全景声|hdr)\b/giu," ").replace(/[-_.,()]+/gu," ").replace(/\s+/g," ").trim()}function Rtr(e){let t=/(第?)(0*(\d{1,8}|[零一二三四五六七八九十百千万亿]+))((?:期|季)[上中下]?[（(]?[上中下]?[)）]?)/u.exec(e);if(t)return`${t[1]}${sh(t[2])}${t[4].replace(/[（）()]/gu,"")}`;let n=[...String(e).matchAll(/(?:s\d+.*?e|e)(\d{1,8})(?!\d)/giu)].pop();if(n)return sh(n[1]);if(t=/第([零一二三四五六七八九十百千万亿]+)[集話话]/u.exec(e),t){let s=ph0(t[1]);return s>0?String(s):""}return t=/第(\d{1,8})[集話话]/u.exec(e),t||(t=/ep(\d{1,8})/iu.exec(e),t)||(t=/(\d{1,8})[集話话]/u.exec(e),t)?sh(t[1]):""}function Ctr(e){let t=String(e);for(let n of t.matchAll(/0*(\d{1,8})/g)){let s=n.index>0?t[n.index-1]:"",c=t[n.index+n[0].length]||"";if(!(fh0(s)||fh0(c))&&lme(n[1],!0))return sh(n[1])}return""}function sh(e){return String(e||"").replace(/[零一二三四五六七八九十百千万亿]+|\d+/gu,t=>{if(/^\d+$/u.test(t))return t.replace(/^0+(?!$)/u,"");let n=ph0(t);return n>0?String(n):t})}function ph0(e){if(!e)return-1;let t=0,n=0,s=0;for(let c of String(e)){if(uh0.has(c)){s=s*10+uh0.get(c);continue}let l=Etr.get(c);if(!l)return-1;l>=1e4?(n=(n+s)*l,t+=n,n=0):(s===0&&l>=10&&(s=1),n+=s*l),s=0}return t+=n+s,t>0&&t<=Number.MAX_SAFE_INTEGER?t:-1}function lme(e,t=!1){let n=Number.parseInt(e,10);return!Number.isFinite(n)||!t&&n<=0?!1:!(n>=1900&&n<=2100)}function lh0(e){return/[\u4e00-\u9fa5]/.test(e)}function fh0(e){return/[a-zA-Z0-9]/.test(e)}function Ntr(e){return String(e||"").split(/[.\s]+/u).map(n=>n.replace(/^[\[【][^\]】]*[\]】]/u,"").replace(ume,"").replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/gu,"").trim()).filter(Boolean).find(n=>/[\u4e00-\u9fa5]{2,}/u.test(n))||""}function mh0(e){return new RegExp(e.map(Otr).join("|"),"giu")}function Otr(e){return String(e).replace(/[.*+?^${}()|[\]\\]/g,"\\$&").replace(/\\\\/g,"\\")}var Dtr=800,Ptr=30*1e3;function gh0(e,t,n,s=null){if(e?.autoDanmakuEnabled===!1||!e?.danmuApi||!e?.messageToDart||!Btr(t)||!Ltr(n)||Mtr(n))return;let c=$tr(s,n),l=setTimeout(()=>{dme(e,c).catch(d=>{e.log?.warn?.({error:d},"[Danmaku] auto push failed")})},Dtr);typeof l.unref=="function"&&l.unref()}async function dme(e,t={}){let n=await e.messageToDart({action:"getPlayInfo",opt:{}}),s=n?.title,c=Utr(n?.episodeName,t.episodeName,t.fileName,n?.flag),l=fme(s)||yh0(s),d=_Y(c)||cw(c);if(!l)return e.log?.info?.("[Danmaku] auto skipped: empty title"),!1;let m=`${l}@@${d}`,g=Date.now();if(e.autoDanmakuState||(e.autoDanmakuState={lastKey:"",lastTime:0}),e.autoDanmakuState.lastKey===m&&g-e.autoDanmakuState.lastTime<Ptr)return e.log?.info?.({title:l,episode:d},"[Danmaku] auto skipped: duplicate"),!1;e.autoDanmakuState={lastKey:m,lastTime:g};let y=e.server.address()?.port||9988,v=new URLSearchParams({name:l});d&&v.set("episode",d);let w=`http://127.0.0.1:${y}/danmu/auto?${v.toString()}`;return await e.messageToDart({action:"danmuPush",opt:{url:w}}),e.log?.info?.({title:l,episode:d,url:w},"[Danmaku] auto pushed"),!0}async function bh0(e,t,n=""){let s=fme(t)||yh0(t);if(!s)throw new Error("\u5F39\u5E55\u5267\u540D\u4E0D\u80FD\u4E3A\u7A7A");let c=new URLSearchParams({name:s}),l=_Y(n)||cw(n);l&&c.set("episode",l);let m=(await e.getFongmiCandidates(c)).find(g=>g?.url);if(!m)throw new Error(`\u5F39\u5E55\u5339\u914D\u5931\u8D25\uFF1A${l?`${s} ${l}`:s}`);return e.getCommentXmlFromCandidate(m.url)}function Btr(e){let t=Number(e?.meta?.type||3);return Number.isFinite(t)&&t<10}function Ltr(e){return!e||typeof e!="object"?!1:!!(e.url||e.parse!==void 0&&e.url!==void 0)}function Mtr(e){return!e||typeof e!="object"?!1:hh0(e.nodanmu)||hh0(e.extra?.nodanmu)}function hh0(e){if(e===!0||e===1)return!0;let t=String(e||"").trim().toLowerCase();return t==="true"||t==="1"||t==="yes"||t==="on"}function yh0(e){return String(e||"").replace(/\s+/g," ").trim()}function cw(e){return String(e||"").replace(/\s+/g," ").trim()}function Utr(...e){for(let t of e){let n=cw(t);if(n&&_Y(n))return n}return cw(e.find(t=>cw(t))||"")}function $tr(e,t){let n=e?.body||{},s=xw(n.episodeName,n.name,n.fileName,n.title),c=Ftr(n.id||n.url||n.playUrl),l=xw(t?.episodeName,t?.name,t?.fileName,t?.title);return{episodeName:xw(s,c,l),fileName:xw(c,s,l)}}function xw(...e){for(let t of e){let n=cw(t);if(n)return n}return""}function Ftr(e){let t=Vtr(e);return t?xw(t.name,t.fileName,t.title,Wtr(t.playToken)):""}function Wtr(e){if(!e)return"";try{let t=typeof e=="string"?JSON.parse(e):e;return xw(t?.fileName,t?.name,t?.title)}catch{return""}}function Vtr(e){let t=String(e||"").trim();if(!t)return null;for(let n of jtr(t))try{let s=JSON.parse(Buffer.from(n,"base64").toString("utf8"));if(s&&typeof s=="object")return s}catch{}return null}function jtr(e){let t=String(e||"").trim(),n=Gtr(t);return[...new Set([t,n,t.replace(/-/g,"+").replace(/_/g,"/"),n.replace(/-/g,"+").replace(/_/g,"/")].filter(Boolean))]}function Gtr(e){try{return decodeURIComponent(e)}catch{return String(e||"")}}async function kh0(e){let t={config:e.config,credentials:e.credentials,db:e.db,messageToDart:e.messageToDart,remoteWexConfig:e.remoteWexConfig},n=await ch0(t);e.spiders=n,e.decorate("panService",t.panService),e.decorate("panAdapter",t.panAdapter);for(let l of n)await Ah0(e,l,`/spider/${l.meta.key}/${l.meta.type}`),await Ah0(e,l,`/spider/${l.meta.key}`);let s=await e.db.get("/config/sites/list",[]),c=qtr(s,n);await e.db.set("/config/sites/list",c,{notify:!1})}async function Ah0(e,t,n){await e.register(async s=>{s.post("/init",t.init?.bind(t)||Htr),t.support&&s.post("/support",t.support.bind(t)),t.home&&s.post("/home",t.home.bind(t)),t.homeVod&&s.post("/homeVod",t.homeVod.bind(t)),t.homeVideo&&s.post("/homeVideo",t.homeVideo.bind(t)),t.category&&s.post("/category",t.category.bind(t)),t.detail&&s.post("/detail",t.detail.bind(t)),t.play&&s.post("/play",async(c,l)=>{let d=await t.play.call(t,c,l);return gh0(e,t,d,c),d}),t.search&&s.post("/search",t.search.bind(t)),t.test&&s.get("/test",t.test.bind(t)),t.lrcproxy&&s.get("/lrcproxy/:token",t.lrcproxy.bind(t)),t.proxy&&(s.get("/proxy/:provider/:sessionId",t.proxy.bind(t)),s.get("/proxy/*",t.proxy.bind(t)))},{prefix:n})}async function Htr(){return{}}function qtr(e,t){let n=new Map(t.map(d=>[`nodejs_${d.meta.key}`,d])),s=new Set,c=(d,m={})=>{let g=`nodejs_${d.meta.key}`,y={...m,key:g,name:d.meta.name,type:d.meta.type,enable:m.enable??!0,searchable:m.searchable??d.meta.searchable??1,quickSearch:m.quickSearch??d.meta.quickSearch??1,filterable:m.filterable??d.meta.filterable??1};return d.meta.changeable!==void 0&&(y.changeable=m.changeable??d.meta.changeable),d.meta.style!==void 0&&(y.style=m.style??d.meta.style),y},l=[];for(let d of e.filter(m=>m&&m.key)){let m=n.get(d.key);m&&(s.add(d.key),l.push(c(m,d)))}for(let d of t){let m=`nodejs_${d.meta.key}`;s.has(m)||l.push(c(d))}return l}D7();Pr();Cn();$r();ES();Ga();Pr();$r();Cn();x6();$ye();function ydr(e,t,n=!1){if(t===0&&!n)return e.map(l=>({...l,t:l.t!==void 0?l.t:parseFloat(l.p.split(",")[0])}));let s=e.reduce((l,d)=>{let m=d.t!==void 0?d.t:parseFloat(d.p.split(",")[0]),g=t===0?m.toFixed(2):Math.floor(m/(t*60));return l[g]||(l[g]=[]),l[g].push({...d,t:m}),l},{});return Object.keys(s).map(l=>{let m=s[l].reduce((g,y)=>{let v=y.m.split(" X")[0].trim();if(g[v]||(g[v]={count:0,earliestT:y.t,cid:y.cid,p:y.p,like:0,color_v2:y.color_v2,sources:new Set}),g[v].count+=1,g[v].earliestT=Math.min(g[v].earliestT,y.t),g[v].color_v2===void 0&&y.color_v2!==void 0&&(g[v].color_v2=y.color_v2),g[v].like+=y.like!==void 0?y.like:0,y.p){let w=y.p.match(/\[([^\]]*)\]$/);w&&w[1]&&w[1].split(/[&＆]/).forEach(T=>{T.trim()&&g[v].sources.add(T.trim())})}return g},{});return Object.keys(m).map(g=>{let y=m[g],v=Math.max(1,y.sources.size),w=Math.round(y.count/v);w<1&&(w=1);let T=Array.from(y.sources).join("\uFF06"),I=y.p.replace(/\[([^\]]*)\]$/,`[${T}]`);return{cid:y.cid,p:I,m:w>1?`${g}\u200Ax\u200A${w}`:g,t:y.earliestT,like:y.like,...y.color_v2!==void 0?{color_v2:y.color_v2}:{}}})}).flat().sort((l,d)=>l.t-d.t)}function Adr(e){if(!te.likeSwitch)return e;let t=new Set(["[hanjutv]","[sohu]","[bilibili1]","[migu]"]);return e.map(n=>{if(!n.like||n.like<5)return n;let s=n.p.match(/,(\[[^\]]+\])$/)?.[1]||"",d=s.includes("\u97E9\u5C0F\u5708")||s.includes("\u6781\u901F\u7248")||t.has(s)?100:1e3,m=n.like>=d?"\u{1F525}":"\uFE0F\u2661",g;n.like>=1e4?g=(n.like/1e4).toFixed(1)+"w":n.like>=1e3?g=(n.like/1e3).toFixed(1)+"k":g=n.like.toString();let y=`\u200A${m}${g}`,v=n.m+y,{like:w,...T}=n;return{...T,m:v}})}function kdr(e,t){if(t===0)return e;let n=t*1e3,s=e.length;if(s<=n)return e;let c=s/n,l=[];for(let d=0;d<n;d++){let m=Math.floor(d*c);l.push(e[m])}return l}function Pw0(e){return e.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}function vdr(e){if(!e||typeof e!="string")return[];let t=e.replace(/，/g,","),n=d=>{let m=d+1;for(;m<t.length;){if(t[m]==="\\"){m+=2;continue}if(t[m]==="/"){let y=t.slice(m+1).match(/^([a-z]*)(\s*)(?:,|$)/);if(y)return m+1+y[1].length+y[2].length}m++}return-1},s=[],c="",l=0;for(;l<t.length;){let d=t[l];if(d==="/"){let m=n(l);if(m!==-1){c+=t.slice(l,m),l=m;continue}c+=d,l++;continue}if(d===","){s.push(c),c="",l++;continue}c+=d,l++}return c.trim()!==""&&s.push(c),s.map(d=>d.trim()).filter(d=>d!=="")}function _dr(e){let t=e.match(/^\/([\s\S]+)\/([a-z]*)$/);if(t)try{return new RegExp(t[1],t[2].replace(/[gy]/g,""))}catch(n){return U("warn",`[system] [danmu] \u65E0\u6548\u7684\u5C4F\u853D\u8BCD\u6B63\u5219(\u5DF2\u6309\u5B57\u9762\u91CF\u5904\u7406): ${e}`,n?.message||n),new RegExp(Pw0(e))}return new RegExp(Pw0(e))}function wdr(e,t,n){let s=c=>Math.round((e>>c&255)+((t>>c&255)-(e>>c&255))*n);return s(16)<<16|s(8)<<8|s(0)}var Bw0={bilibili:"16478873,3389695",sweet:"16739211,10639871",cyber:"65415,6352895",sunset:"16754470,16732754",ocean:"3027346,1835007",mint:"4450683,3733975",rainbow:"16711680,16753920,16776960,65280,65535,255,8388863"};function Sdr(e){let t=String(e||"").trim().toLowerCase();return t&&Object.prototype.hasOwnProperty.call(Bw0,t)?Bw0[t]:e}function Edr(e){let t=String(e||"").split(",").map(s=>parseInt(s.trim(),10)).filter(s=>!isNaN(s)&&s>=0&&s<=16777215);if(t.length===0)return null;if(t.length===1)return()=>t[0];let n=t.length-1;return s=>{let c=Math.min(Math.max(s,0),1)*n,l=Math.min(Math.floor(c),n-1);return wdr(t[l],t[l+1],c-l)}}function vP(e,t){let n=[],s=1,c=!1,l=0,d=[];if(typeof e=="string")d=[...e.matchAll(/<d p="([^"]+)">([^<]+)<\/d>/g)].map(L=>({p:L[1],m:L[2]}));else if(e&&Array.isArray(e.danmuku)){let L={right:1,top:4,bottom:5},q=W=>W?parseInt(W.replace("#",""),16):16777215;d=e.danmuku.map(W=>({timepoint:W[0],ct:L[W[1]]!==void 0?L[W[1]]:1,color:q(W[2]),content:W[4]}))}else Array.isArray(e)&&(d=e);if(!d.length)return[];for(let L of d){let q,W,F,J,ee;if("progress"in L&&"mode"in L&&"content"in L)F=(L.progress/1e3).toFixed(2),J=L.mode||1,ee=L.color||16777215,W=L.content;else if("timepoint"in L)F=parseFloat(L.timepoint).toFixed(2),J=L.ct||0,ee=L.color||16777215,W=L.content;else{if(!("p"in L))continue;let ae=L.p.split(",");F=parseFloat(ae[0]).toFixed(2),J=ae[1]||0,ae.length===4?ee=ae[2]||16777215:ae.length>=8?ee=ae[3]||16777215:ee=ae[3]||ae[2]||16777215,W=L.m}let ne=L._sourceLabel||t;L.realTimeSource&&!ne.includes(L.realTimeSource)&&(ne=`${ne}\uFF06${L.realTimeSource}`),!c&&/[&＆]/.test(ne)&&(c=!0),q=[F,J,ee,`[${ne}]`].join(",");let re={p:q,m:W,cid:s++,like:L?.like};L.color_v2&&(re.color_v2=L.color_v2,l++),n.push(re)}l>0&&U("info",`[system] [danmu] [danmu convert] \u900F\u4F20\u4E86 ${l} \u6761\u6E90\u6E10\u53D8\u8272\u5F39\u5E55\uFF08color_v2\uFF09`);let m=te.danmuSimplifiedTraditional==="simplified"?pi:te.danmuSimplifiedTraditional==="traditional"?wl:null;if(m){n=n.map(q=>({...q,m:typeof q.m=="string"?m(q.m):q.m}));let L=te.danmuSimplifiedTraditional==="simplified"?"\u7B80\u4F53\u5B57":"\u7E41\u4F53\u5B57";U("info",`[system] [danmu] [danmu convert] \u8F6C\u6362\u4E86 ${n.length} \u6761\u5F39\u5E55\u4E3A${L}`)}let y=vdr(te.blockedWords).map(_dr);y.length===0?te.blockedWords&&te.blockedWords.trim()!==""?U("warn",`[system] [danmu] [blocked-words] \u274C \u5DF2\u914D\u7F6E\u5C4F\u853D\u8BCD\u4F46\u672A\u89E3\u6790\u51FA\u6709\u6548\u89C4\u5219\uFF0C\u672C\u6B21\u4E0D\u4F1A\u8FC7\u6EE4\u4EFB\u4F55\u5F39\u5E55\uFF01\u539F\u59CB\u914D\u7F6E: ${JSON.stringify(te.blockedWords)}`):U("info","[system] [danmu] [blocked-words] \u672A\u914D\u7F6E\u5C4F\u853D\u8BCD(BLOCKED_WORDS \u4E3A\u7A7A)\uFF0C\u8DF3\u8FC7\u8FC7\u6EE4"):U("info",`[system] [danmu] [blocked-words] \u89C4\u5219\u89E3\u6790\u6210\u529F: \u5171 ${y.length} \u6761 [ ${y.map(L=>L.toString()).join(" , ")} ]`);let v=new Array(y.length).fill(0),w=[],T=n.filter(L=>{for(let q=0;q<y.length;q++)if(y[q].test(L.m))return v[q]++,w.length<3&&w.push(`\u300C${String(L.m).slice(0,30)}\u300D\u2190 ${y[q].toString()}`),!1;return!0}),I=n.length-T.length;if(y.length>0)if(I>0){let L=y.map((q,W)=>({rule:q.toString(),count:v[W]})).filter(q=>q.count>0).map(q=>`${q.rule} \xD7${q.count}`).join(", ");U("info",`[system] [danmu] [blocked-words] \u2705 \u5C4F\u853D\u8BCD\u5DF2\u751F\u6548: \u62E6\u622A ${I}/${n.length} \u6761\u5F39\u5E55${L?`\uFF0C\u547D\u4E2D\u660E\u7EC6: ${L}`:""}`),w.length&&U("info",`[system] [danmu] [blocked-words] \u62E6\u622A\u793A\u4F8B(\u6700\u591A3\u6761): ${w.join(" | ")}`)}else U("info",`[system] [danmu] [blocked-words] \u26A0\uFE0F \u89C4\u5219\u5DF2\u52A0\u8F7D(${y.length} \u6761)\u4F46\u672C\u96C6\u5F39\u5E55\u65E0\u547D\u4E2D`);U("info",`[system] [danmu] \u53BB\u91CD\u5206\u949F\u6570: ${te.groupMinute}`);let N=ydr(T,te.groupMinute,c),C=Adr(N),B=kdr(C,te.danmuLimit);if(te.convertTopBottomToScroll||te.convertColor==="white"||te.convertColor==="color"){let L=0,q=0,W=0,F=te.convertColor==="color"?Edr(Sdr(te.gradientColors)):null,J=Math.min(Math.max(te.gradientChance||0,0),100)/100;B=B.map(ee=>{let ne=ee.p.split(",");if(ne.length<3)return ee;let re=parseInt(ne[1],10),ae=parseInt(ne[2],10),se=!1;te.convertTopBottomToScroll&&(re===4||re===5)&&(L++,re=1,se=!0),te.convertColor==="white"&&ae!==16777215&&(q++,ae=16777215,se=!0);let be=(typeof te.colorPool=="string"?te.colorPool:"").split(",").map(Je=>parseInt(Je.trim(),10)).filter(Je=>!isNaN(Je)&&Je>=0&&Je<=16777215),ke=be.length>0?be:[16777215],Se=ke[Math.floor(Math.random()*ke.length)];if(te.convertColor==="color"&&ae===16777215&&ee.color_v2===void 0){let Je=Se;if(F&&Math.random()<J){let Ye=parseFloat(ne[0])||0;Je=F(Ye%60/60),W++}ae!==Je&&(q++,ae=Je,se=!0)}if(se){let Je=[ne[0],re,ae,...ne.slice(3)].join(",");return{...ee,p:Je}}return ee}),L>0&&U("info",`[system] [danmu] [danmu convert] \u8F6C\u6362\u4E86 ${L} \u6761\u9876\u90E8/\u5E95\u90E8\u5F39\u5E55\u4E3A\u6D6E\u52A8\u5F39\u5E55`),q>0&&U("info",`[system] [danmu] [danmu convert] \u8F6C\u6362\u4E86 ${q} \u6761\u5F39\u5E55\u989C\u8272\uFF08\u5176\u4E2D\u6E10\u53D8\u8272\u5F39\u5E55 ${W} \u6761\uFF09`)}return U("info",`[system] [danmu] danmus_original: ${n.length}`),U("info",`[system] [danmu] danmus_filter: ${T.length}`),U("info",`[system] [danmu] danmus_group: ${N.length}`),U("info",`[system] [danmu] danmus_limit: ${B.length}`),U("info","[system] [danmu] Top 5 danmus:",JSON.stringify(B.slice(0,5),null,2)),B}function g8e(e){return typeof e.r!="number"||e.r<0||e.r>255||typeof e.g!="number"||e.g<0||e.g>255||typeof e.b!="number"||e.b<0||e.b>255?-1:e.r*256*256+e.g*256+e.b}function RS(e){return typeof e!="string"||e.length!==6||!/^[0-9A-Fa-f]{6}$/.test(e)?16777215:parseInt(e,16)}function Tdr(e){let t=`<?xml version="1.0" ?>
 `;t+=`<i>
 `;let n=e.comments||[];if(Array.isArray(n))for(let s of n){let c=Rdr(s);t+='    <d p="'+Cdr(c)+'">'+Ndr(s.m)+`</d>
