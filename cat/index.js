@@ -3178,6 +3178,11 @@ function createSpider(site) {
         return (sess && sess.headers) || {};
     }
 
+    function liveProxySessionExpiresAt(sessionKey) {
+        const sess = sessionKey ? liveProxySessions.get(sessionKey) : null;
+        return (sess && sess.expiresAt) || 0;
+    }
+
     function parseLiveProxySessionKey(s) {
         const parts = String(s || "").split("|");
         if (parts.length < 3) return null;
@@ -3562,6 +3567,21 @@ function createSpider(site) {
                     return [400, "application/json", JSON.stringify({ error: "missing u" }), { "Content-Type": "application/json" }];
                 }
                 try {
+                    // 主动续签：会话 30 秒内过期则提前重签，避免播放器拿到过期分片地址
+                    const nowSec = Date.now() / 1000;
+                    if (liveProxySessionExpiresAt(query.s) < nowSec + 30) {
+                        const parsed = parseLiveProxySessionKey(query.s);
+                        const channel = parsed && findChannel(parsed.channelId);
+                        if (channel) {
+                            try {
+                                const fetched = await fetchLivePlaylist(channel, parsed.source, parsed.rate);
+                                const rewritten = rewriteLivePlaylist(fetched.playlistText, fetched.upstreamUrl, fetched.sessionKey);
+                                return [200, "application/vnd.apple.mpegurl", rewritten, { "Content-Type": "application/vnd.apple.mpegurl" }];
+                            } catch (e) {
+                                // fall through to normal fetch
+                            }
+                        }
+                    }
                     let res = await httpRequest({ url: u, headers: liveProxySessionHeaders(query.s), timeoutSeconds: 15 });
                     if (res.status !== 200 || !res.body) {
                         // 上游变体列表地址过期：重新签名后返回新版主列表，
