@@ -3248,17 +3248,19 @@ function createSpider(site) {
 
     async function fetchLivePlaylist(channel, source, rate) {
         // 返回 {playlistText, upstreamUrl, sessionKey}；上游地址过期时自动重签。
+        // 注意：重试时保持原 source，不要回退到 auto——代理的 source 是
+        // play() 精心选定的（如 Device 强制走 BK），auto 会重新选回坏的源。
         const sessionKey = liveProxySessionKey(channel.id, source, rate);
         let result;
         try {
             result = await resolveSource(channel, { source, rate }, false);
         } catch (e) {
-            result = await resolveSource(channel, { source: "auto", rate }, true);
+            result = await resolveSource(channel, { source, rate }, true);
         }
         let res = await httpRequest({ url: result.url, headers: result.headers || {}, timeoutSeconds: 15 });
         if (res.status !== 200 || !res.body || res.body.indexOf("#EXTM3U") < 0) {
-            // 上游地址可能刚过期：强制重新解析一次再拉
-            result = await resolveSource(channel, { source: "auto", rate }, true);
+            // 上游地址可能刚过期：强制重新解析一次再拉（保持原 source）
+            result = await resolveSource(channel, { source, rate }, true);
             res = await httpRequest({ url: result.url, headers: result.headers || {}, timeoutSeconds: 15 });
             if (res.status !== 200 || !res.body || res.body.indexOf("#EXTM3U") < 0) {
                 throw new Error("上游列表拉取失败 HTTP " + res.status);
@@ -3560,14 +3562,15 @@ function createSpider(site) {
                     if (res.status !== 200 || !res.body) {
                         // 上游变体列表地址过期：重新签名后返回新版主列表，
                         // 播放器重解析即拿到新变体地址，不断流。
-                        const ok = await refreshLiveProxySession(query.s);
-                        if (ok) {
-                            const parsed = parseLiveProxySessionKey(query.s);
-                            const channel = parsed && findChannel(parsed.channelId);
-                            if (channel) {
+                        const parsed = parseLiveProxySessionKey(query.s);
+                        const channel = parsed && findChannel(parsed.channelId);
+                        if (channel) {
+                            try {
                                 const fetched = await fetchLivePlaylist(channel, parsed.source, parsed.rate);
                                 const rewritten = rewriteLivePlaylist(fetched.playlistText, fetched.upstreamUrl, fetched.sessionKey);
                                 return [200, "application/vnd.apple.mpegurl", rewritten, { "Content-Type": "application/vnd.apple.mpegurl" }];
+                            } catch (e) {
+                                // fall through to 502
                             }
                         }
                         return [502, "text/plain", "upstream playlist error", { "Content-Type": "text/plain" }];
