@@ -3178,6 +3178,26 @@ function createSpider(site) {
         return (sess && sess.headers) || {};
     }
 
+    function parseLiveProxySessionKey(s) {
+        const parts = String(s || "").split("|");
+        if (parts.length < 3) return null;
+        return { channelId: parts[0], source: parts[1], rate: parts.slice(2).join("|") };
+    }
+
+    async function refreshLiveProxySession(s) {
+        // 上游地址过期时重新签名，更新会话中的 headers/upstreamUrl/expiresAt。
+        const parsed = parseLiveProxySessionKey(s);
+        if (!parsed) return false;
+        const channel = findChannel(parsed.channelId);
+        if (!channel) return false;
+        try {
+            await fetchLivePlaylist(channel, parsed.source, parsed.rate);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
     function resolveUpstreamUrl(absoluteOrRelative, baseUrl) {
         try {
             return new URL(absoluteOrRelative, baseUrl).toString();
@@ -3536,8 +3556,20 @@ function createSpider(site) {
                     return [400, "application/json", JSON.stringify({ error: "missing u" }), { "Content-Type": "application/json" }];
                 }
                 try {
-                    const res = await httpRequest({ url: u, headers: liveProxySessionHeaders(query.s), timeoutSeconds: 15 });
+                    let res = await httpRequest({ url: u, headers: liveProxySessionHeaders(query.s), timeoutSeconds: 15 });
                     if (res.status !== 200 || !res.body) {
+                        // 上游变体列表地址过期：重新签名后返回新版主列表，
+                        // 播放器重解析即拿到新变体地址，不断流。
+                        const ok = await refreshLiveProxySession(query.s);
+                        if (ok) {
+                            const parsed = parseLiveProxySessionKey(query.s);
+                            const channel = parsed && findChannel(parsed.channelId);
+                            if (channel) {
+                                const fetched = await fetchLivePlaylist(channel, parsed.source, parsed.rate);
+                                const rewritten = rewriteLivePlaylist(fetched.playlistText, fetched.upstreamUrl, fetched.sessionKey);
+                                return [200, "application/vnd.apple.mpegurl", rewritten, { "Content-Type": "application/vnd.apple.mpegurl" }];
+                            }
+                        }
                         return [502, "text/plain", "upstream playlist error", { "Content-Type": "text/plain" }];
                     }
                     const rewritten = rewriteLivePlaylist(res.body, u, query.s || "");
@@ -3552,8 +3584,11 @@ function createSpider(site) {
                     return [400, "application/json", JSON.stringify({ error: "missing u" }), { "Content-Type": "application/json" }];
                 }
                 try {
-                    const res = await httpBinary({ url: u, headers: liveProxySessionHeaders(query.s), timeoutSeconds: 30 });
+                    let res = await httpBinary({ url: u, headers: liveProxySessionHeaders(query.s), timeoutSeconds: 30 });
                     if (res.status !== 200 || !res.body) {
+                        // 上游分片地址过期：刷新会话让后续请求用新地址；
+                        // 当前分片已过直播边缘，直接 502，播放器会重拉列表跟上。
+                        await refreshLiveProxySession(query.s);
                         return [502, "text/plain", "upstream segment error", { "Content-Type": "text/plain" }];
                     }
                     const buf = Buffer.from(res.body, "base64");
