@@ -3178,31 +3178,6 @@ function createSpider(site) {
         return (sess && sess.headers) || {};
     }
 
-    function liveProxySessionExpiresAt(sessionKey) {
-        const sess = sessionKey ? liveProxySessions.get(sessionKey) : null;
-        return (sess && sess.expiresAt) || 0;
-    }
-
-    function parseLiveProxySessionKey(s) {
-        const parts = String(s || "").split("|");
-        if (parts.length < 3) return null;
-        return { channelId: parts[0], source: parts[1], rate: parts.slice(2).join("|") };
-    }
-
-    async function refreshLiveProxySession(s) {
-        // 上游地址过期时重新签名，更新会话中的 headers/upstreamUrl/expiresAt。
-        const parsed = parseLiveProxySessionKey(s);
-        if (!parsed) return false;
-        const channel = findChannel(parsed.channelId);
-        if (!channel) return false;
-        try {
-            await fetchLivePlaylist(channel, parsed.source, parsed.rate);
-            return true;
-        } catch (e) {
-            return false;
-        }
-    }
-
     function resolveUpstreamUrl(absoluteOrRelative, baseUrl) {
         try {
             return new URL(absoluteOrRelative, baseUrl).toString();
@@ -3220,8 +3195,6 @@ function createSpider(site) {
     }
 
     function rewriteLivePlaylist(text, upstreamPlaylistUrl, sessionKey) {
-        // 全代理：变体列表、分片、key 全部走代理地址，播放器只认本地，
-        // 代理在后台重签上游地址，对播放器透明，保证不断流。
         const lines = String(text || "").split(/\r?\n/);
         const out = [];
         const sParam = "&s=" + encodeURIComponent(sessionKey || "");
@@ -3255,19 +3228,17 @@ function createSpider(site) {
 
     async function fetchLivePlaylist(channel, source, rate) {
         // 返回 {playlistText, upstreamUrl, sessionKey}；上游地址过期时自动重签。
-        // 注意：重试时保持原 source，不要回退到 auto——代理的 source 是
-        // play() 精心选定的（如 Device 强制走 BK），auto 会重新选回坏的源。
         const sessionKey = liveProxySessionKey(channel.id, source, rate);
         let result;
         try {
             result = await resolveSource(channel, { source, rate }, false);
         } catch (e) {
-            result = await resolveSource(channel, { source, rate }, true);
+            result = await resolveSource(channel, { source: "auto", rate }, true);
         }
         let res = await httpRequest({ url: result.url, headers: result.headers || {}, timeoutSeconds: 15 });
         if (res.status !== 200 || !res.body || res.body.indexOf("#EXTM3U") < 0) {
-            // 上游地址可能刚过期：强制重新解析一次再拉（保持原 source）
-            result = await resolveSource(channel, { source, rate }, true);
+            // 上游地址可能刚过期：强制重新解析一次再拉
+            result = await resolveSource(channel, { source: "auto", rate }, true);
             res = await httpRequest({ url: result.url, headers: result.headers || {}, timeoutSeconds: 15 });
             if (res.status !== 200 || !res.body || res.body.indexOf("#EXTM3U") < 0) {
                 throw new Error("上游列表拉取失败 HTTP " + res.status);
@@ -3481,10 +3452,9 @@ function createSpider(site) {
             try {
                 const result = await resolveSource(channel, { source, rate: options.defaultRate });
                 device.mediaActivity({ kind: "activity", sessionID: "play", channelID: channel.id });
-                // 方案2全代理：列表和分片全部走本地代理地址，播放器只认本地；
-                // 代理在后台重签上游地址，对播放器透明，保证不断流。
-                // 注意：Device 的 VDN 签名头在代理多请求下不稳定，强制改走 BK。
-                const proxySource = result.source === "device" ? "bk" : liveProxySource(result.source);
+                // 方案2：不直接给上游短有效期地址，改给本地代理地址；代理在
+                // 服务端持续续签，播放器轮询代理地址即可不断流。
+                const proxySource = liveProxySource(result.source);
                 const response = {
                     parse: 0,
                     url: liveProxyPlaylistUrl(channel.id, proxySource, options.defaultRate),
@@ -3563,36 +3533,8 @@ function createSpider(site) {
                     return [400, "application/json", JSON.stringify({ error: "missing u" }), { "Content-Type": "application/json" }];
                 }
                 try {
-                    // 主动续签：会话 30 秒内过期则提前重签，避免播放器拿到过期分片地址
-                    const nowSec = Date.now() / 1000;
-                    if (liveProxySessionExpiresAt(query.s) < nowSec + 30) {
-                        const parsed = parseLiveProxySessionKey(query.s);
-                        const channel = parsed && findChannel(parsed.channelId);
-                        if (channel) {
-                            try {
-                                const fetched = await fetchLivePlaylist(channel, parsed.source, parsed.rate);
-                                const rewritten = rewriteLivePlaylist(fetched.playlistText, fetched.upstreamUrl, fetched.sessionKey);
-                                return [200, "application/vnd.apple.mpegurl", rewritten, { "Content-Type": "application/vnd.apple.mpegurl" }];
-                            } catch (e) {
-                                // fall through to normal fetch
-                            }
-                        }
-                    }
-                    let res = await httpRequest({ url: u, headers: liveProxySessionHeaders(query.s), timeoutSeconds: 15 });
+                    const res = await httpRequest({ url: u, headers: liveProxySessionHeaders(query.s), timeoutSeconds: 15 });
                     if (res.status !== 200 || !res.body) {
-                        // 上游变体列表地址过期：重新签名后返回新版主列表，
-                        // 播放器重解析即拿到新变体地址，不断流。
-                        const parsed = parseLiveProxySessionKey(query.s);
-                        const channel = parsed && findChannel(parsed.channelId);
-                        if (channel) {
-                            try {
-                                const fetched = await fetchLivePlaylist(channel, parsed.source, parsed.rate);
-                                const rewritten = rewriteLivePlaylist(fetched.playlistText, fetched.upstreamUrl, fetched.sessionKey);
-                                return [200, "application/vnd.apple.mpegurl", rewritten, { "Content-Type": "application/vnd.apple.mpegurl" }];
-                            } catch (e) {
-                                // fall through to 502
-                            }
-                        }
                         return [502, "text/plain", "upstream playlist error", { "Content-Type": "text/plain" }];
                     }
                     const rewritten = rewriteLivePlaylist(res.body, u, query.s || "");
@@ -3607,11 +3549,8 @@ function createSpider(site) {
                     return [400, "application/json", JSON.stringify({ error: "missing u" }), { "Content-Type": "application/json" }];
                 }
                 try {
-                    let res = await httpBinary({ url: u, headers: liveProxySessionHeaders(query.s), timeoutSeconds: 30 });
+                    const res = await httpBinary({ url: u, headers: liveProxySessionHeaders(query.s), timeoutSeconds: 30 });
                     if (res.status !== 200 || !res.body) {
-                        // 上游分片地址过期：刷新会话让后续请求用新地址；
-                        // 当前分片已过直播边缘，直接 502，播放器会重拉列表跟上。
-                        await refreshLiveProxySession(query.s);
                         return [502, "text/plain", "upstream segment error", { "Content-Type": "text/plain" }];
                     }
                     const buf = Buffer.from(res.body, "base64");
