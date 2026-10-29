@@ -3215,6 +3215,8 @@ function createSpider(site) {
     }
 
     function rewriteLivePlaylist(text, upstreamPlaylistUrl, sessionKey) {
+        // 混合代理：变体列表走代理（可重签），分片走上游直链（播放器带静态头直接拉）。
+        // BK 头是静态的（User-Agent/Referer），分片直链无过期复用问题；代理只负责列表重签。
         const lines = String(text || "").split(/\r?\n/);
         const out = [];
         const sParam = "&s=" + encodeURIComponent(sessionKey || "");
@@ -3240,8 +3242,9 @@ function createSpider(site) {
                 continue;
             }
             if (line.startsWith("#")) { out.push(line); continue; }
+            // 分片：保留上游直链，不走代理（播放器用 play() 返回的静态头直接拉）
             const abs = resolveUpstreamUrl(line.trim(), upstreamPlaylistUrl);
-            out.push(options.proxyBase + "/spider/ysp/3/proxy/seg?u=" + encodeURIComponent(abs) + sParam);
+            out.push(abs);
         }
         return out.join("\n");
     }
@@ -3474,16 +3477,17 @@ function createSpider(site) {
             try {
                 const result = await resolveSource(channel, { source, rate: options.defaultRate });
                 device.mediaActivity({ kind: "activity", sessionID: "play", channelID: channel.id });
-                // 方案2：不直接给上游短有效期地址，改给本地代理地址；代理在
-                // 服务端持续续签，播放器轮询代理地址即可不断流。
-                // 注意：Device 的 VDN 签名头（APPSIGN/APPRANDOMSTR）在代理的多
-                // 次请求下不稳定（疑似单次有效），导致央视台在代理下一直转圈；
-                // 代理统一改走 BK（静态头），卫视已验证 BK 在代理下稳定。
+                // 方案2混合代理：列表走本地代理（可重签），分片走上游直链。
+                // 注意：Device 的 VDN 签名头在代理多请求下不稳定，强制改走 BK；
+                // BK 头是静态的，播放器可直接用它们拉分片直链。
+                const BK_STATIC_HEADERS = { "User-Agent": "qqlive", "Referer": "https://live.cctv.cn/" };
                 const proxySource = result.source === "device" ? "bk" : liveProxySource(result.source);
+                // 分片直链需要的头：BK 用静态头；JCE 用解析返回的头。
+                const proxyHeaders = proxySource === "bk" ? BK_STATIC_HEADERS : (result.headers || {});
                 const response = {
                     parse: 0,
                     url: liveProxyPlaylistUrl(channel.id, proxySource, options.defaultRate),
-                    header: {},
+                    header: proxyHeaders,
                     list: [detailVod(channel)],
                 };
                 if (result.source === "JCE" && CATCHUP_IDS.has(channel.id)) {
