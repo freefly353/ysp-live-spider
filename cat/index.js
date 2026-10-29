@@ -3454,7 +3454,10 @@ function createSpider(site) {
                 device.mediaActivity({ kind: "activity", sessionID: "play", channelID: channel.id });
                 // 方案2：不直接给上游短有效期地址，改给本地代理地址；代理在
                 // 服务端持续续签，播放器轮询代理地址即可不断流。
-                const proxySource = liveProxySource(result.source);
+                // 注意：Device 的 VDN 签名头（APPSIGN/APPRANDOMSTR）在代理的多
+                // 次请求下不稳定（疑似单次有效），导致央视台在代理下一直转圈；
+                // 代理统一改走 BK（静态头），卫视已验证 BK 在代理下稳定。
+                const proxySource = result.source === "device" ? "bk" : liveProxySource(result.source);
                 const response = {
                     parse: 0,
                     url: liveProxyPlaylistUrl(channel.id, proxySource, options.defaultRate),
