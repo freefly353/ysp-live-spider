@@ -3462,11 +3462,16 @@ function createSpider(site) {
                     playUrl = liveProxyPlaylistUrl(channel.id, proxySrc, options.defaultRate);
                     playHeader = result.headers || {};
                 }
+                // 在频道名后显示当前源，方便区分（用户要求）
+                const srcLabel = result.source === "device" ? "Device" : result.source === "JCE" ? "JCE" : "BK";
+                const channelWithSrc = Object.assign({}, channel, {
+                    name: channel.name + " [" + srcLabel + "]",
+                });
                 const response = {
                     parse: 0,
                     url: playUrl,
                     header: playHeader,
-                    list: [detailVod(channel)],
+                    list: [detailVod(channelWithSrc)],
                 };
                 if (result.source === "JCE" && CATCHUP_IDS.has(channel.id)) {
                     const now = Math.floor(Date.now() / 1000);
