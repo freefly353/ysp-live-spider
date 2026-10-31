@@ -3252,6 +3252,116 @@ function createSpider(site) {
         return { channel, source };
     }
 
+    // ---- 极简直播代理（闭包版，不依赖 this）----
+    // Device 直连；BK/JCE 走代理：去 ENDLIST 强制直播模式 + 过期重签。
+    // 全代理：列表/变体/切片全部走代理，播放器永远看不到上游签名地址。
+    const liveProxySessions = new Map();
+
+    function liveProxySessionKey(channelId, source, rate) {
+        return channelId + "|" + source + "|" + (rate || "36p");
+    }
+
+    function liveProxyPlaylistUrl(channelId, source, rate) {
+        return (
+            options.proxyBase +
+            "/spider/ysp/3/proxy/live.m3u8?channel=" +
+            encodeURIComponent(channelId) +
+            "&source=" +
+            encodeURIComponent(source) +
+            "&rate=" +
+            encodeURIComponent(rate || "36p")
+        );
+    }
+
+    function liveProxySessionHeaders(sessionKey) {
+        const sess = sessionKey ? liveProxySessions.get(sessionKey) : null;
+        return (sess && sess.headers) || {};
+    }
+
+    function liveProxyResolveUrl(absoluteOrRelative, baseUrl) {
+        try {
+            return new URL(absoluteOrRelative, baseUrl).toString();
+        } catch {
+            return absoluteOrRelative;
+        }
+    }
+
+    function rewriteLivePlaylist(text, upstreamPlaylistUrl, sessionKey) {
+        const lines = String(text || "").split(/\r?\n/);
+        const out = [];
+        const sParam = "&s=" + encodeURIComponent(sessionKey || "");
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (!line) { out.push(line); continue; }
+            if (line.trim() === "#EXT-X-ENDLIST") continue; // 去 ENDLIST，强制直播
+            if (line.startsWith("#EXT-X-STREAM-INF")) {
+                out.push(line);
+                if (i + 1 < lines.length && lines[i + 1] && !lines[i + 1].startsWith("#")) {
+                    const abs = liveProxyResolveUrl(lines[i + 1].trim(), upstreamPlaylistUrl);
+                    out.push(options.proxyBase + "/spider/ysp/3/proxy/pl.m3u8?u=" + encodeURIComponent(abs) + sParam);
+                    i++;
+                }
+                continue;
+            }
+            if (line.startsWith("#EXT-X-KEY") || line.startsWith("#EXT-X-MAP") || line.startsWith("#EXT-X-MEDIA")) {
+                const rewritten = line.replace(/URI="([^"]+)"/g, (m, uri) => {
+                    const abs = liveProxyResolveUrl(uri, upstreamPlaylistUrl);
+                    const action = line.startsWith("#EXT-X-MEDIA") ? "pl.m3u8" : "key";
+                    return 'URI="' + options.proxyBase + "/spider/ysp/3/proxy/" + action + "?u=" + encodeURIComponent(abs) + sParam + '"';
+                });
+                out.push(rewritten);
+                continue;
+            }
+            if (line.startsWith("#")) { out.push(line); continue; }
+            const abs = liveProxyResolveUrl(line.trim(), upstreamPlaylistUrl);
+            // 全代理：分片也走代理，播放器永远看不到带签名的上游地址
+            out.push(options.proxyBase + "/spider/ysp/3/proxy/seg?u=" + encodeURIComponent(abs) + sParam);
+        }
+        return out.join("\n");
+    }
+
+    async function fetchLivePlaylist(channel, source, rate) {
+        const sessionKey = liveProxySessionKey(channel.id, source, rate);
+        let result;
+        try {
+            result = await resolveSource(channel, { source, rate }, false);
+        } catch (e) {
+            result = await resolveSource(channel, { source, rate }, true);
+        }
+        let res = await httpRequest({ url: result.url, headers: result.headers || {}, timeoutSeconds: 15 });
+        if (res.status !== 200 || !res.body || res.body.indexOf("#EXTM3U") < 0) {
+            result = await resolveSource(channel, { source, rate }, true);
+            res = await httpRequest({ url: result.url, headers: result.headers || {}, timeoutSeconds: 15 });
+            if (res.status !== 200 || !res.body || res.body.indexOf("#EXTM3U") < 0) {
+                throw new Error("上游列表拉取失败 HTTP " + res.status);
+            }
+        }
+        liveProxySessions.set(sessionKey, {
+            headers: result.headers || {},
+            expiresAt: result.expiresAt || Date.now() / 1000 + 300,
+            upstreamUrl: result.url,
+        });
+        if (liveProxySessions.size > 128) liveProxySessions.delete(liveProxySessions.keys().next().value);
+        return { playlistText: res.body, upstreamUrl: result.url, sessionKey };
+    }
+
+    async function ensureLiveSessionFresh(sessionKey, channel, source, rate) {
+        const sess = sessionKey ? liveProxySessions.get(sessionKey) : null;
+        const now = Date.now() / 1000;
+        if (sess && sess.expiresAt && sess.expiresAt > now + 30) {
+            return sess.headers || {};
+        }
+        if (channel) {
+            try {
+                const fetched = await fetchLivePlaylist(channel, source, rate);
+                return liveProxySessionHeaders(fetched.sessionKey);
+            } catch (e) {
+                log("live session refresh failed: " + String((e && e.message) || e).slice(0, 100));
+            }
+        }
+        return (sess && sess.headers) || {};
+    }
+
     const spider = {
         meta: {
             key: "ysp",
@@ -3335,120 +3445,6 @@ function createSpider(site) {
             return page(items, pg, 20);
         },
 
-        // ---- 极简直播代理 ----
-        // Device 直连（用户实测可一直播）；BK/JCE 走代理：去 ENDLIST 强制直播
-        // 模式 + 过期重签。分片走直链（BK 头静态），代理只处理列表。
-        // 会话：sessionKey -> {headers, expiresAt, upstreamUrl}
-        // 注意：本文件其余部分为 pre-proxy 基线，此段为新增。
-        _liveProxySessions: new Map(),
-
-        _liveProxySessionKey(channelId, source, rate) {
-            return channelId + "|" + source + "|" + (rate || "36p");
-        },
-
-        _liveProxyPlaylistUrl(channelId, source, rate) {
-            return (
-                options.proxyBase +
-                "/spider/ysp/3/proxy/live.m3u8?channel=" +
-                encodeURIComponent(channelId) +
-                "&source=" +
-                encodeURIComponent(source) +
-                "&rate=" +
-                encodeURIComponent(rate || "36p")
-            );
-        },
-
-        _liveProxySessionHeaders(sessionKey) {
-            const sess = sessionKey ? this._liveProxySessions.get(sessionKey) : null;
-            return (sess && sess.headers) || {};
-        },
-
-        _resolveUpstreamUrl(absoluteOrRelative, baseUrl) {
-            try {
-                return new URL(absoluteOrRelative, baseUrl).toString();
-            } catch {
-                return absoluteOrRelative;
-            }
-        },
-
-        _rewriteLivePlaylist(text, upstreamPlaylistUrl, sessionKey) {
-            const lines = String(text || "").split(/\r?\n/);
-            const out = [];
-            const sParam = "&s=" + encodeURIComponent(sessionKey || "");
-            for (let i = 0; i < lines.length; i++) {
-                const line = lines[i];
-                if (!line) { out.push(line); continue; }
-                if (line.trim() === "#EXT-X-ENDLIST") continue; // 去 ENDLIST，强制直播
-                if (line.startsWith("#EXT-X-STREAM-INF")) {
-                    out.push(line);
-                    if (i + 1 < lines.length && lines[i + 1] && !lines[i + 1].startsWith("#")) {
-                        const abs = this._resolveUpstreamUrl(lines[i + 1].trim(), upstreamPlaylistUrl);
-                        out.push(options.proxyBase + "/spider/ysp/3/proxy/pl.m3u8?u=" + encodeURIComponent(abs) + sParam);
-                        i++;
-                    }
-                    continue;
-                }
-                if (line.startsWith("#EXT-X-KEY") || line.startsWith("#EXT-X-MAP") || line.startsWith("#EXT-X-MEDIA")) {
-                    const rewritten = line.replace(/URI="([^"]+)"/g, (m, uri) => {
-                        const abs = this._resolveUpstreamUrl(uri, upstreamPlaylistUrl);
-                        const action = line.startsWith("#EXT-X-MEDIA") ? "pl.m3u8" : "key";
-                        return 'URI="' + options.proxyBase + "/spider/ysp/3/proxy/" + action + "?u=" + encodeURIComponent(abs) + sParam + '"';
-                    });
-                    out.push(rewritten);
-                    continue;
-                }
-                if (line.startsWith("#")) { out.push(line); continue; }
-                const abs = this._resolveUpstreamUrl(line.trim(), upstreamPlaylistUrl);
-                // 全代理：分片也走代理，播放器永远看不到带签名的上游地址
-                out.push(options.proxyBase + "/spider/ysp/3/proxy/seg?u=" + encodeURIComponent(abs) + sParam);
-            }
-            return out.join("\n");
-        },
-
-        // 检查会话 Token 是否快过期（提前 30 秒），是则重签。返回最新的 headers。
-        async _ensureLiveSessionFresh(sessionKey, channel, source, rate) {
-            const sess = sessionKey ? this._liveProxySessions.get(sessionKey) : null;
-            const now = Date.now() / 1000;
-            if (sess && sess.expiresAt && sess.expiresAt > now + 30) {
-                return sess.headers || {};
-            }
-            // 过期或快过期：重新解析拿新 Token
-            if (channel) {
-                try {
-                    const fetched = await this._fetchLivePlaylist(channel, source, rate);
-                    return this._liveProxySessionHeaders(fetched.sessionKey);
-                } catch (e) {
-                    log("live session refresh failed: " + String((e && e.message) || e).slice(0, 100));
-                }
-            }
-            return (sess && sess.headers) || {};
-        },
-
-        async _fetchLivePlaylist(channel, source, rate) {
-            const sessionKey = this._liveProxySessionKey(channel.id, source, rate);
-            let result;
-            try {
-                result = await resolveSource(channel, { source, rate }, false);
-            } catch (e) {
-                result = await resolveSource(channel, { source, rate }, true);
-            }
-            let res = await httpRequest({ url: result.url, headers: result.headers || {}, timeoutSeconds: 15 });
-            if (res.status !== 200 || !res.body || res.body.indexOf("#EXTM3U") < 0) {
-                result = await resolveSource(channel, { source, rate }, true);
-                res = await httpRequest({ url: result.url, headers: result.headers || {}, timeoutSeconds: 15 });
-                if (res.status !== 200 || !res.body || res.body.indexOf("#EXTM3U") < 0) {
-                    throw new Error("上游列表拉取失败 HTTP " + res.status);
-                }
-            }
-            this._liveProxySessions.set(sessionKey, {
-                headers: result.headers || {},
-                expiresAt: result.expiresAt || Date.now() / 1000 + 300,
-                upstreamUrl: result.url,
-            });
-            if (this._liveProxySessions.size > 128) this._liveProxySessions.delete(this._liveProxySessions.keys().next().value);
-            return { playlistText: res.body, upstreamUrl: result.url, sessionKey };
-        },
-
         async play(flag, id, vipFlags) {
             const { channel, source } = parsePlayId(flag, id);
             if (!channel) return { parse: 0, msg: "无效的播放 ID" };
@@ -3463,7 +3459,7 @@ function createSpider(site) {
                     playHeader = result.headers || {};
                 } else {
                     const proxySrc = result.source === "JCE" ? "jce" : "bk";
-                    playUrl = this._liveProxyPlaylistUrl(channel.id, proxySrc, options.defaultRate);
+                    playUrl = liveProxyPlaylistUrl(channel.id, proxySrc, options.defaultRate);
                     playHeader = result.headers || {};
                 }
                 const response = {
@@ -3531,8 +3527,8 @@ function createSpider(site) {
                 const source = ["auto", "device", "bk", "jce"].includes(query.source) ? query.source : "auto";
                 const rate = query.rate || options.defaultRate;
                 try {
-                    const fetched = await this._fetchLivePlaylist(channel, source, rate);
-                    const rewritten = this._rewriteLivePlaylist(fetched.playlistText, fetched.upstreamUrl, fetched.sessionKey);
+                    const fetched = await fetchLivePlaylist(channel, source, rate);
+                    const rewritten = rewriteLivePlaylist(fetched.playlistText, fetched.upstreamUrl, fetched.sessionKey);
                     return [200, "application/vnd.apple.mpegurl", rewritten, { "Content-Type": "application/vnd.apple.mpegurl" }];
                 } catch (e) {
                     return [502, "application/json", JSON.stringify({ error: String((e && e.message) || e).slice(0, 200) }), { "Content-Type": "application/json" }];
@@ -3544,11 +3540,11 @@ function createSpider(site) {
                     return [400, "application/json", JSON.stringify({ error: "missing u" }), { "Content-Type": "application/json" }];
                 }
                 try {
-                    const res = await httpRequest({ url: u, headers: this._liveProxySessionHeaders(query.s), timeoutSeconds: 15 });
+                    const res = await httpRequest({ url: u, headers: liveProxySessionHeaders(query.s), timeoutSeconds: 15 });
                     if (res.status !== 200 || !res.body) {
                         return [502, "text/plain", "upstream playlist error", { "Content-Type": "text/plain" }];
                     }
-                    const rewritten = this._rewriteLivePlaylist(res.body, u, query.s || "");
+                    const rewritten = rewriteLivePlaylist(res.body, u, query.s || "");
                     return [200, "application/vnd.apple.mpegurl", rewritten, { "Content-Type": "application/vnd.apple.mpegurl" }];
                 } catch (e) {
                     return [502, "application/json", JSON.stringify({ error: String((e && e.message) || e).slice(0, 200) }), { "Content-Type": "application/json" }];
@@ -3571,7 +3567,7 @@ function createSpider(site) {
                     }
                 }
                 try {
-                    const headers = await this._ensureLiveSessionFresh(sKey, channel, source, rate);
+                    const headers = await ensureLiveSessionFresh(sKey, channel, source, rate);
                     const res = await httpBinary({ url: u, headers, timeoutSeconds: 20 });
                     if (res.status !== 200 || !res.body) {
                         return [502, "text/plain", "upstream segment error", { "Content-Type": "text/plain" }];
@@ -3614,7 +3610,7 @@ function createSpider(site) {
             cache.clear();
             pending.clear();
             jceCooldown.clear();
-            if (this._liveProxySessions) this._liveProxySessions.clear();
+            if (liveProxySessions) liveProxySessions.clear();
         },
 
         // 仅供本地验证。
