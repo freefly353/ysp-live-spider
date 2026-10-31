@@ -3462,16 +3462,18 @@ function createSpider(site) {
                     playUrl = liveProxyPlaylistUrl(channel.id, proxySrc, options.defaultRate);
                     playHeader = result.headers || {};
                 }
-                // 在频道名后显示当前源，方便区分（用户要求）
+                // 在选集名后显示当前源（JSTV 标题是 "{频道名} - {选集名}"，选集名来自 vod_play_url）
+                // 用户要求：能看出当前用的是哪个源
                 const srcLabel = result.source === "device" ? "Device" : result.source === "JCE" ? "JCE" : "BK";
-                const channelWithSrc = Object.assign({}, channel, {
-                    name: channel.name + " [" + srcLabel + "]",
-                });
+                const vodItem = detailVod(channel);
+                if (vodItem.vod_play_url) {
+                    vodItem.vod_play_url = vodItem.vod_play_url.replace(/直播\$/g, "直播[" + srcLabel + "]$");
+                }
                 const response = {
                     parse: 0,
                     url: playUrl,
                     header: playHeader,
-                    list: [detailVod(channelWithSrc)],
+                    list: [vodItem],
                 };
                 if (result.source === "JCE" && CATCHUP_IDS.has(channel.id)) {
                     const now = Math.floor(Date.now() / 1000);
@@ -3578,7 +3580,8 @@ function createSpider(site) {
                         return [502, "text/plain", "upstream segment error", { "Content-Type": "text/plain" }];
                     }
                     const ct = u.includes(".m4s") ? "video/mp4" : "video/mp2t";
-                    return [200, ct, res.body, { "Content-Type": ct }];
+                    // httpBinary 返回 base64 字符串（JCE 路径依赖它）；分片必须还二进制给播放器
+                    return [200, ct, Buffer.from(res.body, "base64"), { "Content-Type": ct }];
                 } catch (e) {
                     return [502, "application/json", JSON.stringify({ error: String((e && e.message) || e).slice(0, 200) }), { "Content-Type": "application/json" }];
                 }
