@@ -3542,11 +3542,7 @@ function createSpider(site) {
                 }
             }
             if (action === "pl") {
-                const u = query.u;
-                if (!u) {
-                    return [400, "application/json", JSON.stringify({ error: "missing u" }), { "Content-Type": "application/json" }];
-                }
-                // 解析 session key，拿到 channel/source/rate 用于续期
+                // 解析 session key，拿到 channel/source/rate
                 const sKey = query.s || "";
                 let channel = null, source = "auto", rate = options.defaultRate;
                 if (sKey) {
@@ -3557,33 +3553,35 @@ function createSpider(site) {
                         rate = parts[2] || options.defaultRate;
                     }
                 }
+                if (!channel) {
+                    return [400, "application/json", JSON.stringify({ error: "invalid session" }), { "Content-Type": "application/json" }];
+                }
                 try {
-                    // 先确保 session 有效（Token 快过期就重签），再拿变体列表
-                    const headers = await ensureLiveSessionFresh(sKey, channel, source, rate);
-                    let res = await httpRequest({ url: u, headers, timeoutSeconds: 15 });
-                    if (res.status !== 200 || !res.body) {
-                        // 上游变体地址失效（Token 过期），重拉主列表拿新地址再试一次
-                        if (channel) {
-                            const fetched = await fetchLivePlaylist(channel, source, rate);
-                            // 从新主列表里找变体地址（取第一个）
-                            const lines = String(fetched.playlistText).split(/\r?\n/);
-                            let newVariantUrl = null;
-                            for (let i = 0; i < lines.length; i++) {
-                                if (lines[i].startsWith("#EXT-X-STREAM-INF") && i + 1 < lines.length) {
-                                    newVariantUrl = liveProxyResolveUrl(lines[i + 1].trim(), fetched.upstreamUrl);
-                                    break;
-                                }
+                    // 无状态：每次都拉新主列表，从中取变体地址，保证 Token 永远新鲜
+                    // （播放器约 10 秒请求一次 pl，多一次上游请求可接受）
+                    const fetched = await fetchLivePlaylist(channel, source, rate);
+                    const lines = String(fetched.playlistText).split(/\r?\n/);
+                    let variantUrl = null;
+                    for (let i = 0; i < lines.length; i++) {
+                        if (lines[i].startsWith("#EXT-X-STREAM-INF") && i + 1 < lines.length) {
+                            const cand = lines[i + 1].trim();
+                            if (cand && !cand.startsWith("#")) {
+                                variantUrl = liveProxyResolveUrl(cand, fetched.upstreamUrl);
+                                break;
                             }
-                            if (newVariantUrl) {
-                                const newHeaders = liveProxySessionHeaders(fetched.sessionKey);
-                                res = await httpRequest({ url: newVariantUrl, headers: newHeaders, timeoutSeconds: 15 });
-                            }
-                        }
-                        if (res.status !== 200 || !res.body) {
-                            return [502, "text/plain", "upstream playlist error", { "Content-Type": "text/plain" }];
                         }
                     }
-                    const rewritten = rewriteLivePlaylist(res.body, u, sKey);
+                    // 主列表本身就是分片列表（无变体），直接返回改写后的
+                    if (!variantUrl) {
+                        const rewritten = rewriteLivePlaylist(fetched.playlistText, fetched.upstreamUrl, fetched.sessionKey);
+                        return [200, "application/vnd.apple.mpegurl", rewritten, { "Content-Type": "application/vnd.apple.mpegurl" }];
+                    }
+                    const vHeaders = liveProxySessionHeaders(fetched.sessionKey);
+                    const res = await httpRequest({ url: variantUrl, headers: vHeaders, timeoutSeconds: 15 });
+                    if (res.status !== 200 || !res.body) {
+                        return [502, "text/plain", "upstream playlist error", { "Content-Type": "text/plain" }];
+                    }
+                    const rewritten = rewriteLivePlaylist(res.body, variantUrl, fetched.sessionKey);
                     return [200, "application/vnd.apple.mpegurl", rewritten, { "Content-Type": "application/vnd.apple.mpegurl" }];
                 } catch (e) {
                     return [502, "application/json", JSON.stringify({ error: String((e && e.message) || e).slice(0, 200) }), { "Content-Type": "application/json" }];
