@@ -3330,19 +3330,19 @@ function createSpider(site) {
     }
 
     async function fetchLivePlaylist(channel, source, rate) {
+        // JCE 时间窗口式 VOD 不适合代理直播：窗口不滑动时播放器拿不到新分片。
+        // 直播代理一律走 BK（真直播 HLS 流）；JCE 只用于 timeshift 回看（直接调 jce.resolve）。
+        const effSource = source === "jce" ? "bk" : source;
         const sessionKey = liveProxySessionKey(channel.id, source, rate);
         let result;
-        // JCE 是时间窗口式 VOD（非真直播滑动窗口），必须每次 fresh resolve 滑动窗口，
-        // 否则缓存的 14 分钟旧窗口返回同一批分片，播放器播完就停。
-        const forceJCE = source === "jce";
         try {
-            result = await resolveSource(channel, { source, rate }, forceJCE);
+            result = await resolveSource(channel, { source: effSource, rate }, false);
         } catch (e) {
-            result = await resolveSource(channel, { source, rate }, true);
+            result = await resolveSource(channel, { source: effSource, rate }, true);
         }
         let res = await httpRequest({ url: result.url, headers: result.headers || {}, timeoutSeconds: 15 });
         if (res.status !== 200 || !res.body || res.body.indexOf("#EXTM3U") < 0) {
-            result = await resolveSource(channel, { source, rate }, true);
+            result = await resolveSource(channel, { source: effSource, rate }, true);
             res = await httpRequest({ url: result.url, headers: result.headers || {}, timeoutSeconds: 15 });
             if (res.status !== 200 || !res.body || res.body.indexOf("#EXTM3U") < 0) {
                 throw new Error("上游列表拉取失败 HTTP " + res.status);
