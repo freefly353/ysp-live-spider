@@ -3318,16 +3318,20 @@ function createSpider(site) {
             if (line.startsWith("#EXT-X-KEY") || line.startsWith("#EXT-X-MAP") || line.startsWith("#EXT-X-MEDIA")) {
                 const rewritten = line.replace(/URI="([^"]+)"/g, (m, uri) => {
                     const abs = liveProxyResolveUrl(uri, upstreamPlaylistUrl);
-                    const action = line.startsWith("#EXT-X-MEDIA") ? "pl.m3u8" : "key";
-                    return 'URI="' + options.proxyBase + "/spider/ysp/3/proxy/" + action + "?u=" + encodeURIComponent(abs) + sParam + '"';
+                    // MEDIA（变体）走代理列表；KEY/MAP 走直链（播放器带 header 直接拿）
+                    if (line.startsWith("#EXT-X-MEDIA")) {
+                        return 'URI="' + options.proxyBase + "/spider/ysp/3/proxy/pl.m3u8?u=" + encodeURIComponent(abs) + sParam + '"';
+                    }
+                    return 'URI="' + abs + '"';
                 });
                 out.push(rewritten);
                 continue;
             }
             if (line.startsWith("#")) { out.push(line); continue; }
             const abs = liveProxyResolveUrl(line.trim(), upstreamPlaylistUrl);
-            // 全代理：分片也走代理，播放器永远看不到带签名的上游地址
-            out.push(options.proxyBase + "/spider/ysp/3/proxy/seg?u=" + encodeURIComponent(abs) + sParam);
+            // 混合代理：分片走上游直链（播放器用 play() 返回的 header 直接拉，避免代理 403）；
+            // 列表走代理重签，保证地址新鲜。
+            out.push(abs);
         }
         return out.join("\n");
     }
