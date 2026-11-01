@@ -3169,8 +3169,6 @@ function createSpider(site) {
         if (pending.size >= 8) throw fail("Resolver concurrency limit reached", 503);
         const task = (async () => {
             let result;
-            // JCE 是时间窗口 VOD，不适合代理直播的连续滑动模型，直接屏蔽（auto 会自然 fallback 到 BK）
-            if (source === "jce" && !window) throw fail("JCE live disabled for proxy", 422);
             if (window || source === "jce") {
                 if (!CATCHUP_IDS.has(channel.id)) throw fail("JCE is unavailable for this channel", 422);
                 const now = Math.floor(Date.now() / 1000);
@@ -3203,8 +3201,7 @@ function createSpider(site) {
                         reason: String(e.message).replace(/https?:\/\/[^\s]+/g, "[URL]").slice(0, 200),
                     };
                 }
-            } else if (false && CATCHUP_IDS.has(channel.id) && (jceCooldown.get(channel.id) || 0) <= Date.now()) {
-                // JCE 直播已屏蔽（窗口 VOD 不适合代理连续播放），auto 直接走 BK
+            } else if (CATCHUP_IDS.has(channel.id) && (jceCooldown.get(channel.id) || 0) <= Date.now()) {
                 try {
                     result = await resolveJCELive(channel);
                 } catch (e) {
@@ -3261,7 +3258,7 @@ function createSpider(site) {
     const liveProxySessions = new Map();
 
     // 构建版本：每次改动递增，diag 里可见，用于确认 JSTV 跑的是不是最新版
-    const LIVE_PROXY_BUILD = "20261101-hybrid-v2";
+    const LIVE_PROXY_BUILD = "v1.0.0";
 
     // 诊断环形缓冲：记录最近 50 次上游拉取结果，供 proxy/diag 动作输出
     const liveProxyDiag = [];
@@ -3342,12 +3339,12 @@ function createSpider(site) {
     async function fetchLivePlaylist(channel, source, rate) {
         const sessionKey = liveProxySessionKey(channel.id, source, rate);
         let result;
-        // BK 分片 URL 签名约 300 秒过期。缓存超过 120 秒就强制刷新，保证分片地址新鲜，
-        // 又不至于每 10 秒 hammer 上游（之前每 10 秒强制刷新疑似触发上游限流）。
+        // BK/JCE 分片 URL 签名有有效期。缓存超过 120 秒就强制刷新，保证地址新鲜，
+        // 又不至于每 10 秒 hammer 上游。
         // 用 liveProxySessions 里存的上次解析时间来判断。
         const sess = liveProxySessions.get(sessionKey);
         const lastFetch = sess && sess.fetchedAt ? sess.fetchedAt : 0;
-        const forceFresh = source === "bk" && Date.now() / 1000 - lastFetch > 120;
+        const forceFresh = (source === "bk" || source === "jce") && Date.now() / 1000 - lastFetch > 120;
         try {
             result = await resolveSource(channel, { source, rate }, forceFresh);
         } catch (e) {
@@ -3477,6 +3474,8 @@ function createSpider(site) {
             try {
                 const result = await resolveSource(channel, { source, rate: options.defaultRate });
                 device.mediaActivity({ kind: "activity", sessionID: "play", channelID: channel.id });
+                // 诊断：记录 play 解析结果（Device 直连也在此）
+                liveProxyDiagPush("play", { ch: channel.id, src: result.source, ok: true });
                 // 极简代理：Device 直连（用户实测可一直播）；BK/JCE 走代理列表
                 // （去 ENDLIST + 过期重签），分片直链。
                 let playUrl, playHeader;
