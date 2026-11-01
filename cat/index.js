@@ -3257,6 +3257,15 @@ function createSpider(site) {
     // 全代理：列表/变体/切片全部走代理，播放器永远看不到上游签名地址。
     const liveProxySessions = new Map();
 
+    // 诊断环形缓冲：记录最近 50 次上游拉取结果，供 proxy/diag 动作输出
+    const liveProxyDiag = [];
+    function liveProxyDiagPush(action, info) {
+        try {
+            liveProxyDiag.push(Object.assign({ t: new Date().toISOString().slice(11, 19), action }, info));
+            while (liveProxyDiag.length > 50) liveProxyDiag.shift();
+        } catch (_) {}
+    }
+
     function liveProxySessionKey(channelId, source, rate) {
         return channelId + "|" + source + "|" + (rate || "36p");
     }
@@ -3578,6 +3587,13 @@ function createSpider(site) {
                     }
                     const vHeaders = liveProxySessionHeaders(fetched.sessionKey);
                     const res = await httpRequest({ url: variantUrl, headers: vHeaders, timeoutSeconds: 15 });
+                    // 诊断：记录变体拉取状态与 media sequence 是否推进
+                    let mseq = null;
+                    try {
+                        const m = String(res.body || "").match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
+                        if (m) mseq = Number(m[1]);
+                    } catch (_) {}
+                    liveProxyDiagPush("pl", { ch: channel ? channel.id : "?", src: source, status: res.status, mseq, ok: res.status === 200 && !!res.body });
                     if (res.status !== 200 || !res.body) {
                         return [502, "text/plain", "upstream playlist error", { "Content-Type": "text/plain" }];
                     }
@@ -3606,6 +3622,7 @@ function createSpider(site) {
                 try {
                     const headers = await ensureLiveSessionFresh(sKey, channel, source, rate);
                     const res = await httpBinary({ url: u, headers, timeoutSeconds: 20 });
+                    liveProxyDiagPush("seg", { ch: channel ? channel.id : "?", src: source, status: res.status, ok: res.status === 200 && !!res.body });
                     if (res.status !== 200 || !res.body) {
                         return [502, "text/plain", "upstream segment error", { "Content-Type": "text/plain" }];
                     }
@@ -3615,6 +3632,11 @@ function createSpider(site) {
                 } catch (e) {
                     return [502, "application/json", JSON.stringify({ error: String((e && e.message) || e).slice(0, 200) }), { "Content-Type": "application/json" }];
                 }
+            }
+            if (action === "diag") {
+                // 诊断输出：最近 50 次上游拉取记录（给 Safari 打开看）
+                const body = JSON.stringify({ diag: liveProxyDiag.slice().reverse() }, null, 1);
+                return [200, "application/json", body, { "Content-Type": "application/json" }];
             }
             if (action !== "timeshift") {
                 return [404, "text/plain", "unknown proxy action", { "Content-Type": "text/plain" }];
