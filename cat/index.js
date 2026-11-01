@@ -3169,6 +3169,8 @@ function createSpider(site) {
         if (pending.size >= 8) throw fail("Resolver concurrency limit reached", 503);
         const task = (async () => {
             let result;
+            // JCE 是时间窗口 VOD，不适合代理直播的连续滑动模型，直接屏蔽（auto 会自然 fallback 到 BK）
+            if (source === "jce" && !window) throw fail("JCE live disabled for proxy", 422);
             if (window || source === "jce") {
                 if (!CATCHUP_IDS.has(channel.id)) throw fail("JCE is unavailable for this channel", 422);
                 const now = Math.floor(Date.now() / 1000);
@@ -3201,7 +3203,8 @@ function createSpider(site) {
                         reason: String(e.message).replace(/https?:\/\/[^\s]+/g, "[URL]").slice(0, 200),
                     };
                 }
-            } else if (CATCHUP_IDS.has(channel.id) && (jceCooldown.get(channel.id) || 0) <= Date.now()) {
+            } else if (false && CATCHUP_IDS.has(channel.id) && (jceCooldown.get(channel.id) || 0) <= Date.now()) {
+                // JCE 直播已屏蔽（窗口 VOD 不适合代理连续播放），auto 直接走 BK
                 try {
                     result = await resolveJCELive(channel);
                 } catch (e) {
@@ -3330,19 +3333,16 @@ function createSpider(site) {
     }
 
     async function fetchLivePlaylist(channel, source, rate) {
-        // JCE 时间窗口式 VOD 不适合代理直播：窗口不滑动时播放器拿不到新分片。
-        // 直播代理一律走 BK（真直播 HLS 流）；JCE 只用于 timeshift 回看（直接调 jce.resolve）。
-        const effSource = source === "jce" ? "bk" : source;
         const sessionKey = liveProxySessionKey(channel.id, source, rate);
         let result;
         try {
-            result = await resolveSource(channel, { source: effSource, rate }, false);
+            result = await resolveSource(channel, { source, rate }, false);
         } catch (e) {
-            result = await resolveSource(channel, { source: effSource, rate }, true);
+            result = await resolveSource(channel, { source, rate }, true);
         }
         let res = await httpRequest({ url: result.url, headers: result.headers || {}, timeoutSeconds: 15 });
         if (res.status !== 200 || !res.body || res.body.indexOf("#EXTM3U") < 0) {
-            result = await resolveSource(channel, { source: effSource, rate }, true);
+            result = await resolveSource(channel, { source, rate }, true);
             res = await httpRequest({ url: result.url, headers: result.headers || {}, timeoutSeconds: 15 });
             if (res.status !== 200 || !res.body || res.body.indexOf("#EXTM3U") < 0) {
                 throw new Error("上游列表拉取失败 HTTP " + res.status);
