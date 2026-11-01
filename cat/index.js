@@ -3262,7 +3262,7 @@ function createSpider(site) {
     const liveProxySessions = new Map();
 
     // 构建版本：每次改动递增，diag 里可见，用于确认 JSTV 跑的是不是最新版
-    const LIVE_PROXY_BUILD = "v1.0.1";
+    const LIVE_PROXY_BUILD = "v1.0.2";
 
     // 诊断环形缓冲：记录最近 50 次上游拉取结果，供 proxy/diag 动作输出
     const liveProxyDiag = [];
@@ -3562,8 +3562,22 @@ function createSpider(site) {
                 }
                 const source = ["auto", "device", "bk", "jce"].includes(query.source) ? query.source : "auto";
                 const rate = query.rate || options.defaultRate;
+                // 上游偶发抽风（非法内容/中断），内部重试 3 次（间隔 3 秒），15 秒内的抖动自己扛，
+                // 实在不行才返回 502，避免播放器因单次失败就放弃。
+                let fetched = null, lastErr = null;
+                for (let attempt = 1; attempt <= 3; attempt++) {
+                    try {
+                        fetched = await fetchLivePlaylist(channel, source, rate);
+                        break;
+                    } catch (e) {
+                        lastErr = e;
+                        if (attempt < 3) {
+                            await new Promise((r) => setTimeout(r, 3000));
+                        }
+                    }
+                }
                 try {
-                    const fetched = await fetchLivePlaylist(channel, source, rate);
+                    if (!fetched) throw lastErr;
                     const rewritten = rewriteLivePlaylist(fetched.playlistText, fetched.upstreamUrl, fetched.sessionKey);
                     liveProxyDiagPush("live", { ch: channel.id, src: source, status: 200, ok: true });
                     return [200, "application/vnd.apple.mpegurl", rewritten, { "Content-Type": "application/vnd.apple.mpegurl" }];
