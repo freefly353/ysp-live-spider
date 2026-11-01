@@ -3335,8 +3335,11 @@ function createSpider(site) {
     async function fetchLivePlaylist(channel, source, rate) {
         const sessionKey = liveProxySessionKey(channel.id, source, rate);
         let result;
+        // BK 分片 URL 签名有效期短，缓存的旧解析返回的列表里分片地址已过期（403）。
+        // 代理每次都强制 fresh，保证分片地址新鲜；play() 的初始解析仍走缓存。
+        const forceFresh = source === "bk";
         try {
-            result = await resolveSource(channel, { source, rate }, false);
+            result = await resolveSource(channel, { source, rate }, forceFresh);
         } catch (e) {
             result = await resolveSource(channel, { source, rate }, true);
         }
