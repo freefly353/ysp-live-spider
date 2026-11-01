@@ -3260,6 +3260,9 @@ function createSpider(site) {
     // 全代理：列表/变体/切片全部走代理，播放器永远看不到上游签名地址。
     const liveProxySessions = new Map();
 
+    // 构建版本：每次改动递增，diag 里可见，用于确认 JSTV 跑的是不是最新版
+    const LIVE_PROXY_BUILD = "20261101-hybrid-v2";
+
     // 诊断环形缓冲：记录最近 50 次上游拉取结果，供 proxy/diag 动作输出
     const liveProxyDiag = [];
     function liveProxyDiagPush(action, info) {
@@ -3650,8 +3653,8 @@ function createSpider(site) {
                 }
             }
             if (action === "diag") {
-                // 诊断输出：最近 50 次上游拉取记录（给 Safari 打开看）
-                const body = JSON.stringify({ diag: liveProxyDiag.slice().reverse() }, null, 1);
+                // 诊断输出：构建版本 + 最近 50 次上游拉取记录（给 Safari 打开看）
+                const body = JSON.stringify({ version: LIVE_PROXY_BUILD, diag: liveProxyDiag.slice().reverse() }, null, 1);
                 return [200, "application/json", body, { "Content-Type": "application/json" }];
             }
             if (action !== "timeshift") {
