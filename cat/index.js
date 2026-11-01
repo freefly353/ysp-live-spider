@@ -3332,8 +3332,11 @@ function createSpider(site) {
     async function fetchLivePlaylist(channel, source, rate) {
         const sessionKey = liveProxySessionKey(channel.id, source, rate);
         let result;
+        // JCE 是时间窗口式 VOD（非真直播滑动窗口），必须每次 fresh resolve 滑动窗口，
+        // 否则缓存的 14 分钟旧窗口返回同一批分片，播放器播完就停。
+        const forceJCE = source === "jce";
         try {
-            result = await resolveSource(channel, { source, rate }, false);
+            result = await resolveSource(channel, { source, rate }, forceJCE);
         } catch (e) {
             result = await resolveSource(channel, { source, rate }, true);
         }
@@ -3545,8 +3548,10 @@ function createSpider(site) {
                 try {
                     const fetched = await fetchLivePlaylist(channel, source, rate);
                     const rewritten = rewriteLivePlaylist(fetched.playlistText, fetched.upstreamUrl, fetched.sessionKey);
+                    liveProxyDiagPush("live", { ch: channel.id, src: source, status: 200, ok: true });
                     return [200, "application/vnd.apple.mpegurl", rewritten, { "Content-Type": "application/vnd.apple.mpegurl" }];
                 } catch (e) {
+                    liveProxyDiagPush("live", { ch: channel.id, src: source, status: 0, ok: false, err: String((e && e.message) || e).slice(0, 60) });
                     return [502, "application/json", JSON.stringify({ error: String((e && e.message) || e).slice(0, 200) }), { "Content-Type": "application/json" }];
                 }
             }
