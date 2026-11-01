@@ -3339,9 +3339,12 @@ function createSpider(site) {
     async function fetchLivePlaylist(channel, source, rate) {
         const sessionKey = liveProxySessionKey(channel.id, source, rate);
         let result;
-        // BK 分片 URL 签名有效期短，缓存的旧解析返回的列表里分片地址已过期（403）。
-        // 代理每次都强制 fresh，保证分片地址新鲜；play() 的初始解析仍走缓存。
-        const forceFresh = source === "bk";
+        // BK 分片 URL 签名约 300 秒过期。缓存超过 120 秒就强制刷新，保证分片地址新鲜，
+        // 又不至于每 10 秒 hammer 上游（之前每 10 秒强制刷新疑似触发上游限流）。
+        // 用 liveProxySessions 里存的上次解析时间来判断。
+        const sess = liveProxySessions.get(sessionKey);
+        const lastFetch = sess && sess.fetchedAt ? sess.fetchedAt : 0;
+        const forceFresh = source === "bk" && Date.now() / 1000 - lastFetch > 120;
         try {
             result = await resolveSource(channel, { source, rate }, forceFresh);
         } catch (e) {
@@ -3359,6 +3362,7 @@ function createSpider(site) {
             headers: result.headers || {},
             expiresAt: result.expiresAt || Date.now() / 1000 + 300,
             upstreamUrl: result.url,
+            fetchedAt: Date.now() / 1000,
         });
         if (liveProxySessions.size > 128) liveProxySessions.delete(liveProxySessions.keys().next().value);
         return { playlistText: res.body, upstreamUrl: result.url, sessionKey };
