@@ -3169,6 +3169,9 @@ function createSpider(site) {
         if (pending.size >= 8) throw fail("Resolver concurrency limit reached", 503);
         const task = (async () => {
             let result;
+            // JCE 是时间窗口 VOD，直播场景下 media sequence 不推进（播 15 秒就停），直接屏蔽；
+            // auto 会自然 fallback 到 BK。回看（window）走 JCE 不受影响。
+            if (source === "jce" && !window) throw fail("JCE live disabled for proxy", 422);
             if (window || source === "jce") {
                 if (!CATCHUP_IDS.has(channel.id)) throw fail("JCE is unavailable for this channel", 422);
                 const now = Math.floor(Date.now() / 1000);
@@ -3201,7 +3204,8 @@ function createSpider(site) {
                         reason: String(e.message).replace(/https?:\/\/[^\s]+/g, "[URL]").slice(0, 200),
                     };
                 }
-            } else if (CATCHUP_IDS.has(channel.id) && (jceCooldown.get(channel.id) || 0) <= Date.now()) {
+            } else if (false && CATCHUP_IDS.has(channel.id) && (jceCooldown.get(channel.id) || 0) <= Date.now()) {
+                // JCE 直播已屏蔽（窗口 VOD，播 15 秒就停），auto 直接走 BK
                 try {
                     result = await resolveJCELive(channel);
                 } catch (e) {
@@ -3258,7 +3262,7 @@ function createSpider(site) {
     const liveProxySessions = new Map();
 
     // 构建版本：每次改动递增，diag 里可见，用于确认 JSTV 跑的是不是最新版
-    const LIVE_PROXY_BUILD = "v1.0.0";
+    const LIVE_PROXY_BUILD = "v1.0.1";
 
     // 诊断环形缓冲：记录最近 50 次上游拉取结果，供 proxy/diag 动作输出
     const liveProxyDiag = [];
@@ -3339,12 +3343,12 @@ function createSpider(site) {
     async function fetchLivePlaylist(channel, source, rate) {
         const sessionKey = liveProxySessionKey(channel.id, source, rate);
         let result;
-        // BK/JCE 分片 URL 签名有有效期。缓存超过 120 秒就强制刷新，保证地址新鲜，
+        // BK 分片 URL 签名有有效期。缓存超过 120 秒就强制刷新，保证地址新鲜，
         // 又不至于每 10 秒 hammer 上游。
-        // 用 liveProxySessions 里存的上次解析时间来判断。
+        // 用 liveProxySessions 里存的上次解析时间来判断。（JCE 直播已屏蔽，此处只有 bk）
         const sess = liveProxySessions.get(sessionKey);
         const lastFetch = sess && sess.fetchedAt ? sess.fetchedAt : 0;
-        const forceFresh = (source === "bk" || source === "jce") && Date.now() / 1000 - lastFetch > 120;
+        const forceFresh = source === "bk" && Date.now() / 1000 - lastFetch > 120;
         try {
             result = await resolveSource(channel, { source, rate }, forceFresh);
         } catch (e) {
