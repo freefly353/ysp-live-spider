@@ -3262,7 +3262,7 @@ function createSpider(site) {
     const liveProxySessions = new Map();
 
     // 构建版本：每次改动递增，diag 里可见，用于确认 JSTV 跑的是不是最新版
-    const LIVE_PROXY_BUILD = "v1.0.2";
+    const LIVE_PROXY_BUILD = "v1.0.3";
 
     // 诊断环形缓冲：记录最近 50 次上游拉取结果，供 proxy/diag 动作输出
     const liveProxyDiag = [];
@@ -3343,12 +3343,13 @@ function createSpider(site) {
     async function fetchLivePlaylist(channel, source, rate) {
         const sessionKey = liveProxySessionKey(channel.id, source, rate);
         let result;
-        // BK 分片 URL 签名有有效期。缓存超过 120 秒就强制刷新，保证地址新鲜，
-        // 又不至于每 10 秒 hammer 上游。
-        // 用 liveProxySessions 里存的上次解析时间来判断。（JCE 直播已屏蔽，此处只有 bk）
+        // BK 分片 URL 签名 300 秒过期。地址剩余有效期不到 180 秒就强制重签，
+        // 保证播放器拿到的列表里分片地址始终有 3 分钟以上余量，不会播着播着过期。
+        // （旧逻辑用 lastFetch 判断是错的：lastFetch 每次 live 请求都更新，差值永远 ~10 秒，
+        //  导致 120 秒刷新从未生效，播到 263 秒还在用 t=0 的旧地址。）
         const sess = liveProxySessions.get(sessionKey);
-        const lastFetch = sess && sess.fetchedAt ? sess.fetchedAt : 0;
-        const forceFresh = source === "bk" && Date.now() / 1000 - lastFetch > 120;
+        const expiresAt = sess && sess.expiresAt ? sess.expiresAt : 0;
+        const forceFresh = source === "bk" && Date.now() / 1000 > expiresAt - 180;
         try {
             result = await resolveSource(channel, { source, rate }, forceFresh);
         } catch (e) {
