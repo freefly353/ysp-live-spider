@@ -1704,6 +1704,57 @@ function createDeviceProtocol() {
     function resolve(channel, rate = "36p") {
         return transaction(() => resolveCurrent(channel, rate));
     }
+    const APP_SECRET_IDLE_MS = 300000;
+    function reusableAppSecret(s) {
+        return s.appSecret && Date.now() - s.appSecretUsedAt < APP_SECRET_IDLE_MS ? s.appSecret : null;
+    }
+    async function fetchAppSecret(s) {
+        const two = await post(
+            "live/02",
+            BASE + "api/live/v1/02",
+            { guid: encrypt("", s.key) },
+            {},
+            false,
+            false,
+            false,
+            s.identity,
+        );
+        const secretValue =
+            typeof two.data === "string" ? two.data : two.data && (two.data.appSecret || two.data.app_secret);
+        if (typeof secretValue !== "string") throw fail("live/02", "Missing appSecret", resultCode(two));
+        s.appSecret = decrypt(secretValue, s.key);
+        s.appSecretUsedAt = Date.now();
+        return s.appSecret;
+    }
+    async function getAppSecret(s) {
+        const cached = reusableAppSecret(s);
+        if (cached) return cached;
+        return fetchAppSecret(s);
+    }
+    async function vdnStream(s, raw, secret) {
+        const random = randomHex(4) + "-0000-" + randomHex(2) + "-0000-00000000" + randomHex(2);
+        const sign = md5Hex(AK + secret + random);
+        const vdn = await post(
+            "VDN",
+            "https://ytpvdn.cctv.cn/cctvmobileinf/rest/cctv/videoliveUrl/getstream",
+            form({
+                appcommon: stable({ adid: "", av: "1.4.1", an: "央视频电视投屏助手", ap: "cctv_app_tv" }),
+                url: raw,
+            }),
+            { APPID: AK, APPSIGN: sign, APPRANDOMSTR: random },
+            true,
+            false,
+            false,
+            s.identity,
+        );
+        if (
+            String(vdn.succeed).replace(/"/g, "") !== "1" ||
+            typeof vdn.url !== "string" ||
+            !/^https?:\/\//.test(vdn.url)
+        )
+            throw fail("VDN", "VDN returned no final URL", resultCode(vdn));
+        return { url: vdn.url, sign, random };
+    }
     async function resolveCurrent(channel, rate) {
         if (!LIVE_IDS[channel.id]) throw fail("device/channel", "Device route unavailable for this channel", null, 422);
         lastAccess = Date.now();
@@ -1750,49 +1801,25 @@ function createDeviceProtocol() {
                 candidates.map((v) => safeRate(v.rate)).join(","),
             );
             const raw = /^https?:\/\//.test(video.url) ? video.url : decrypt(video.url, s.key);
-            const two = await post(
-                "live/02",
-                BASE + "api/live/v1/02",
-                { guid: encrypt("", s.key) },
-                {},
-                false,
-                false,
-                false,
-                s.identity,
-            );
-            const secretValue =
-                typeof two.data === "string" ? two.data : two.data && (two.data.appSecret || two.data.app_secret);
-            if (typeof secretValue !== "string") throw fail("live/02", "Missing appSecret", resultCode(two));
-            const secret = decrypt(secretValue, s.key);
-            const random = randomHex(4) + "-0000-" + randomHex(2) + "-0000-00000000" + randomHex(2);
-            const sign = md5Hex(AK + secret + random);
-            const vdn = await post(
-                "VDN",
-                "https://ytpvdn.cctv.cn/cctvmobileinf/rest/cctv/videoliveUrl/getstream",
-                form({
-                    appcommon: stable({ adid: "", av: "1.4.1", an: "央视频电视投屏助手", ap: "cctv_app_tv" }),
-                    url: raw,
-                }),
-                { APPID: AK, APPSIGN: sign, APPRANDOMSTR: random },
-                true,
-                false,
-                false,
-                s.identity,
-            );
-            if (
-                String(vdn.succeed).replace(/"/g, "") !== "1" ||
-                typeof vdn.url !== "string" ||
-                !/^https?:\/\//.test(vdn.url)
-            )
-                throw fail("VDN", "VDN returned no final URL", resultCode(vdn));
+            const reused = !!reusableAppSecret(s);
+            let signed;
+            try {
+                signed = await vdnStream(s, raw, await getAppSecret(s));
+            } catch (e) {
+                if (!reused) throw e;
+                log("DEVICE appSecret reuse rejected stage=" + (e.stage || "VDN") + "; refreshing live/02");
+                s.appSecret = null;
+                signed = await vdnStream(s, raw, await getAppSecret(s));
+            }
+            s.appSecretUsedAt = Date.now();
             links.set(channel.id, Date.now());
             return {
-                url: vdn.url,
+                url: signed.url,
                 headers: {
                     UID: s.identity.profile.android_id,
                     APPID: AK,
-                    APPSIGN: sign,
-                    APPRANDOMSTR: random,
+                    APPSIGN: signed.sign,
+                    APPRANDOMSTR: signed.random,
                     Referer: "api.cctv.cn",
                     "User-Agent": "cctv_app_tv",
                 },
@@ -1800,7 +1827,7 @@ function createDeviceProtocol() {
                 rate: video.rate || "",
                 quality: video.rateName || video.rate || "未验证",
                 expiresAt: Date.now() / 1000 + 60,
-                candidates: [vdn.url],
+                candidates: [signed.url],
                 resolutionVerified: false,
             };
         } catch (e) {
@@ -3262,7 +3289,7 @@ function createSpider(site) {
     const liveProxySessions = new Map();
 
     // 构建版本：每次改动递增，diag 里可见，用于确认 JSTV 跑的是不是最新版
-    const LIVE_PROXY_BUILD = "v1.0.3";
+    const LIVE_PROXY_BUILD = "v1.0.4";
 
     // 诊断环形缓冲：记录最近 50 次上游拉取结果，供 proxy/diag 动作输出
     const liveProxyDiag = [];
